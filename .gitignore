@@ -1,0 +1,55 @@
+# Home Assistant 日志文件
+config/home-assistant.log
+config/home-assistant.log.*
+config/home-assistant.log.fault
+
+# 数据库文件（运行时数据）
+*.db
+*.db-shm
+*.db-wal
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Home Assistant 内部存储（设备、实体、认证等运行时状态）
+config/.storage/
+
+# 运行时文件
+config/.HA_VERSION
+config/.ha_run.lock
+*.pid
+*.uuid
+
+# 云同步目录
+config/.cloud/
+
+# 依赖目录
+config/deps/
+
+# TTS 缓存
+config/tts/
+
+# 敏感信息
+config/secrets.yaml
+
+# OZW 日志
+config/OZW_Log.txt
+
+# IP 封禁记录
+config/ip_bans.yaml
+
+# 备份文件
+*.backup
+*.bak
+*.swp
+*.swo
+*~
+
+# 文档目录
+# docs/
+
+# Claude Code 配置
+.claude/

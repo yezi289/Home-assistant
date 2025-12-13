@@ -1,0 +1,41 @@
+# 默认：所有文本文件统一使用 LF 存储在仓库中
+* text=auto eol=lf
+
+# C/C++ 源码
+*.c     text eol=lf
+*.h     text eol=lf
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+
+# 脚本
+*.sh    text eol=lf
+*.py    text eol=lf
+
+# 配置与文档
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.xml   text eol=lf
+*.cmake text eol=lf
+Makefile text eol=lf
+
+# 二进制文件：不做任何行尾符转换
+*.pdf   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.bin   binary
+*.hex   binary
+*.elf   binary
+*.a     binary
+*.lib   binary
+*.so    binary
+*.dll   binary
+*.exe   binary
+
+# clangd 索引缓存（二进制）
+*.idx   binary

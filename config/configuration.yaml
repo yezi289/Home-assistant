@@ -1,0 +1,31 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+zha:
+  database_path: /config/zigbee.db
+  # zigpy_config:
+  #   ota:
+  #     extra_providers:
+  #       - type: advanced
+  #         warning: I understand I can *destroy* my devices by enabling OTA updates from files. Some OTA updates can be mistakenly applied to the wrong device, breaking it. I am consciously using this at my own risk.
+  #         path: /config/zigpy_ota
+  enable_quirks: true
+  custom_quirks_path: /config/zha_quirks
+
+# 调试日志配置（用于测试 OTA）
+# logger:
+#   default: info
+#   logs:
+#     zigpy.ota: debug                        # OTA 核心日志
+#     zigpy.ota.provider: debug               # OTA 提供商日志
+#     homeassistant.components.zha: debug     # ZHA 集成日志
+#     bellows.zigbee.application: debug       # Zigbee 应用层日志（如果用 EZSP）
