@@ -163,6 +163,30 @@ zha:
 - **自定义 Quirks**：将设备适配文件放入 `config/zha_quirks/` 目录
 - **OTA 固件更新**：参考 [ZHA本地OTA固件更新教程](docs/ZHA本地OTA固件更新教程.md)
 
+### ZHA 加载失败排查
+
+如果 Home Assistant 页面提示“集成未能加载，请尝试重启 Home Assistant。zha 加载失败”，优先检查 `config/zha_quirks/` 目录是否存在。
+
+本项目在 `configuration.yaml` 中默认启用了以下配置：
+
+```yaml
+zha:
+  enable_quirks: true
+  custom_quirks_path: /config/zha_quirks
+```
+
+如果挂载到容器内的 `/config/zha_quirks` 不存在，Home Assistant 会将 `zha` 判定为无效配置，并在日志中报出类似错误：
+
+```text
+Invalid config for 'zha': not a directory for dictionary value 'zha->custom_quirks_path'
+```
+
+处理方法：
+
+- 确保仓库中的 `config/zha_quirks/` 目录存在
+- 如不需要自定义 quirks，可删除或注释 `custom_quirks_path` 配置
+- 修改后执行 `.\ha.ps1 restart` 或 `./ha.sh restart` 重启 Home Assistant
+
 ## 常用设备
 
 - Zigbee USB Dongle（如 通用 Zigbee USB Dongle、ConBee II）
