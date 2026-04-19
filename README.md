@@ -17,7 +17,6 @@ home-assistant/
 │   ├── automations.yaml     # 自动化配置
 │   ├── scripts.yaml         # 脚本配置
 │   ├── scenes.yaml          # 场景配置
-│   ├── secrets.yaml         # 敏感信息配置
 │   └── zha_quirks/          # ZHA 自定义设备适配
 └── docs/                    # 文档
     ├── USBIPD使用指南.md
