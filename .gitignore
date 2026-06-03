@@ -32,6 +32,9 @@ config/deps/
 # TTS 缓存
 config/tts/
 
+# 本地缓存
+config/.cache/
+
 # 敏感信息
 config/secrets.yaml
 
