@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
+
+_LOGGER = logging.getLogger(__name__)
 
 from zigpy.quirks import CustomCluster
 from zigpy.quirks.v2 import (
@@ -48,6 +51,7 @@ IRRIGATION_PLAN_PAYLOAD_LEN = 28
 IRRIGATION_PLAN_MAX_COUNT = 6
 IRRIGATION_PLAN_SET_COMMAND_ID = 0x06
 IRRIGATION_PLAN_REMOVE_COMMAND_ID = 0x07
+MANUAL_RAIN_DELAY_CONTROL = 0x08
 ZIGBEE_EPOCH_OFFSET = 946684800
 
 def _u16_be(data: bytes) -> int:
@@ -65,6 +69,15 @@ def _put_u32_be(value: int) -> list[int]:
     """Encode an unsigned big-endian 32-bit integer."""
 
     return list(int(value).to_bytes(4, "big"))
+
+
+
+
+class DelayTimestampPayload(t.FixedList):
+    """Raw 4-byte big-endian delay-end Zigbee epoch timestamp."""
+
+    _item_type = t.uint8_t
+    _length = 4
 
 # 日程计划载荷
 class IrrigationPlanPayload(t.FixedList):
@@ -138,19 +151,19 @@ class IrrigationLoopType(t.enum8):
     """Irrigation schedule loop type."""
 
     Even_Day = 0x00
-    Odd_Day = 0x01
-    Days = 0x02
-    Week = 0x03
-    Only = 0x04
+    Odd_Day  = 0x01
+    Days     = 0x02
+    Week     = 0x03
+    Only     = 0x04
 
 
 class IrrigationPlanRepeat(t.enum8):
     """Simplified irrigation schedule repeat mode."""
 
-    Odd_Day = 0x00
+    Odd_Day  = 0x00
     Even_Day = 0x01
     Interval = 0x02
-    Custom = 0x03
+    Custom   = 0x03
 
 # 数据类（对应计划）
 @dataclass
@@ -399,7 +412,13 @@ class SonoffWaterValveCluster(CustomCluster):
             schema={"index": t.uint8_t},
             is_manufacturer_specific=False,
         )
-        
+        # 用户延时设置命令（雨水延迟）—— 4 字节大端 Zigbee epoch
+        user_delay_set = foundation.ZCLCommandDef(
+            id=MANUAL_RAIN_DELAY_CONTROL,
+            schema={"delay_end_timestamp": DelayTimestampPayload},
+            is_manufacturer_specific=False,
+        )
+
     class AttributeDefs(BaseAttributeDefs):
         """SONOFF private attribute definitions."""
 
@@ -542,6 +561,7 @@ class SonoffWaterValveCluster(CustomCluster):
         await self.read_attributes(
             [
                 self.AttributeDefs.unit_of_water_flow.id,
+                self.AttributeDefs.user_delay_end_datetime.id,
             ]
         )
 
@@ -660,10 +680,11 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
             elif attr_id == self.AttributeDefs.amount_unit.id:
                 pending_amount_unit = int(value)
 
+        # 剔除当前模式不可写的属性（过滤而非抛异常，避免 HA 调用链异常）
+        filtered_attributes: dict[str | int | ZCLAttributeDef, Any] = {}
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
-            # 若为时长模式，禁止设置水量和安全时长
             if (
                 pending_mode == SingleIrrigationMode.Duration
                 and attr_id
@@ -672,20 +693,28 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
                     self.AttributeDefs.fail_safe_duration_min.id,
                 )
             ):
-                raise ValueError(
-                    "Single irrigation amount and fail safe duration are only "
-                    "configurable in volume mode"
+                _LOGGER.warning(
+                    "Ignoring attribute %s=%s: only configurable in volume mode "
+                    "(device is in duration mode)",
+                    attr_def.name, value,
                 )
-            # 若为水量模式，禁止设置总时长
+                continue
             if (
                 pending_mode == SingleIrrigationMode.Volume
                 and attr_id == self.AttributeDefs.total_duration_min.id
             ):
-                raise ValueError(
-                    "Single irrigation total duration is only configurable in "
-                    "duration mode"
+                _LOGGER.warning(
+                    "Ignoring attribute %s=%s: only configurable in duration mode "
+                    "(device is in volume mode)",
+                    attr_def.name, value,
                 )
-            
+                continue
+            filtered_attributes[attr] = value
+        # 全部被过滤时直接返回成功，避免空写
+        if not filtered_attributes:
+            return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
+        attributes = filtered_attributes
+
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
@@ -1054,9 +1083,12 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
         start_datetime = _seconds_from_midnight(self._start_hour, self._start_minute)
 
         irrigation_state = SingleIrrigationState()
-        if hasattr(self.endpoint, "sonoff_single_irrigation_config"):
-            config = self.endpoint.sonoff_single_irrigation_config
+        amount_unit = self._amount_unit  # fallback
+        endpoint_1 = self.endpoint.device.endpoints.get(1)
+        if endpoint_1 is not None and hasattr(endpoint_1, "sonoff_single_irrigation_config"):
+            config = endpoint_1.sonoff_single_irrigation_config
             irrigation_state = config._single_irrigation_state
+            amount_unit = config._amount_unit
 
         repeat_value = self._repeat_value
         if self._repeat_mode == IrrigationPlanRepeat.Custom:
@@ -1069,7 +1101,7 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             irrigation_mode=irrigation_state.irrigation_mode,
             start_datetime=start_datetime,
             total_duration_min=irrigation_state.total_duration_min,
-            amount_unit=self._amount_unit,
+            amount_unit=amount_unit,
             amount=irrigation_state.amount,
             fail_safe_duration_min=irrigation_state.fail_safe_duration_min,
             create_datetime=_zigbee_now_timestamp(),
@@ -1148,7 +1180,73 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             return result
         return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
 
-###################### 以下为实体创建（手动灌溉、日程、通用） ###############################
+#****************************** 用户延时（雨水延迟） start *****************************************************
+
+class SonoffUserDelayConfigCluster(LocalDataCluster):
+    """Local cluster for manual rain / user delay configuration.
+
+    Sends command 0x08 on the SONOFF private cluster (0xFC11) which triggers
+    ``rtcScheduleIrrigationTaskSkip()`` in the firmware — marking all irrigation
+    tasks whose start_time falls between now and the delay end timestamp as
+    skipped.  A value of 0 clears the delay.
+    """
+
+    cluster_id = 0xFBFC
+    ep_attribute = "sonoff_user_delay_config"
+
+    class AttributeDefs(BaseAttributeDefs):
+        """Local user-delay configuration attributes."""
+
+        delay_hours: Final = ZCLAttributeDef(id=0x0060, type=t.uint8_t)
+        apply_delay: Final = ZCLAttributeDef(id=0x0061, type=t.uint8_t)
+        clear_delay: Final = ZCLAttributeDef(id=0x0062, type=t.uint8_t)
+
+    def __init__(self, *args, **kwargs):
+        """Initialise with sensible defaults and listen for firmware reports."""
+        super().__init__(*args, **kwargs)
+        self._delay_hours: int = 24
+        self._update_attribute(self.AttributeDefs.delay_hours.id, self._delay_hours)
+
+    async def write_attributes(
+        self,
+        attributes: dict[str | int | ZCLAttributeDef, Any],
+        **_kwargs: Any,
+    ) -> list:
+        """Handle local writes: cache delay_hours, trigger apply/clear via
+        command 0x08 on the real SONOFF cluster."""
+
+        result = []
+        for attr, value in attributes.items():
+            attr_def = self.find_attribute(attr)
+            attr_id = attr_def.id
+            if attr_id == self.AttributeDefs.delay_hours.id:
+                self._delay_hours = int(value)
+                self._update_attribute(attr_id, self._delay_hours)
+            elif attr_id == self.AttributeDefs.apply_delay.id:
+                now_zigbee = _zigbee_now_timestamp()
+                end_timestamp = now_zigbee + self._delay_hours * 3600
+                result = await self.endpoint.sonoff_cluster.command(
+                    MANUAL_RAIN_DELAY_CONTROL,
+                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
+                    manufacturer=None,
+                    expect_reply=False,
+                )
+            elif attr_id == self.AttributeDefs.clear_delay.id:
+                # Send 0 to clear the delay — firmware treats this as
+                # "no tasks in range" which clears all is_delay flags.
+                result = await self.endpoint.sonoff_cluster.command(
+                    MANUAL_RAIN_DELAY_CONTROL,
+                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(0)),
+                    manufacturer=None,
+                    expect_reply=False,
+                )
+
+        if result:
+            return result
+        return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
+
+
+#****************************** 手动灌溉实体 start *****************************************************
 # 把手动默认模式的参数单独创建实体，方便数组数据解析后用于实体(数组数据无法直接用于实体)
 def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
     """Add config entities for the aggregate single irrigation attribute 0x501D."""
@@ -1161,7 +1259,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             SonoffSingleIrrigationConfigCluster.cluster_id,
             entity_type=EntityType.CONFIG,
             translation_key="manual_single_irrigation_mode",
-            fallback_name="手动 single irrigation mode",
+            fallback_name="手动 02 irrigation mode",
         )
         .number(
             SonoffSingleIrrigationConfigCluster.AttributeDefs.total_duration_min.name,
@@ -1174,7 +1272,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="manual_single_irrigation_total_duration",
-            fallback_name="手动 single irrigation total duration",
+            fallback_name="手动 03 irrigation total duration",
         )
         # .number(
         #     SonoffSingleIrrigationConfigCluster.AttributeDefs.duration_min.name,
@@ -1217,7 +1315,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             mode="box",
             # entity_type=EntityType.CONFIG,
             translation_key="manual_single_irrigation_amount",
-            fallback_name="手动 single irrigation amount",
+            fallback_name="手动 04 irrigation amount",
         )
         .number(
             SonoffSingleIrrigationConfigCluster.AttributeDefs.fail_safe_duration_min.name,
@@ -1230,70 +1328,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="manual_single_irrigation_fail_safe_duration",
-            fallback_name="手动 single irrigation fail safe duration",
-        )
-    )
-
-# 通道2 手动灌溉相关实体
-def add_single_irrigation_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuilder:
-    """Add config entities for channel 2 aggregate single irrigation settings."""
-
-    return (
-        builder.adds(SonoffSingleIrrigationConfigCluster, endpoint_id=2)
-        .enum(
-            SonoffSingleIrrigationConfigCluster.AttributeDefs.irrigation_mode.name,
-            SingleIrrigationMode,
-            SonoffSingleIrrigationConfigCluster.cluster_id,
-            endpoint_id=2,
-            entity_type=EntityType.CONFIG,
-            translation_key="manual_ch2_single_irrigation_mode",
-            fallback_name="通道2 手动 single irrigation mode",
-        )
-        .number(
-            SonoffSingleIrrigationConfigCluster.AttributeDefs.total_duration_min.name,
-            SonoffSingleIrrigationConfigCluster.cluster_id,
-            endpoint_id=2,
-            min_value=SINGLE_IRRIGATION_DURATION_MIN_MIN,
-            max_value=SINGLE_IRRIGATION_DURATION_MAX_MIN,
-            step=SINGLE_IRRIGATION_STEP_MIN,
-            device_class=NumberDeviceClass.DURATION,
-            unit=UnitOfTime.MINUTES,
-            mode="box",
-            translation_key="manual_ch2_single_irrigation_total_duration",
-            fallback_name="通道2 手动 single irrigation total duration",
-        )
-        .enum(
-            SonoffSingleIrrigationConfigCluster.AttributeDefs.amount_unit.name,
-            IrrigationAmountUnit,
-            SonoffSingleIrrigationConfigCluster.cluster_id,
-            endpoint_id=2,
-            entity_type=EntityType.CONFIG,
-            translation_key="manual_ch2_irrigation_amount_unit",
-            fallback_name="通道2 手动 irrigation amount unit",
-        )
-        .number(
-            SonoffSingleIrrigationConfigCluster.AttributeDefs.amount.name,
-            SonoffSingleIrrigationConfigCluster.cluster_id,
-            endpoint_id=2,
-            min_value=SINGLE_IRRIGATION_AMOUNT_MIN,
-            max_value=SINGLE_IRRIGATION_AMOUNT_MAX,
-            step=1,
-            mode="box",
-            translation_key="manual_ch2_single_irrigation_amount",
-            fallback_name="通道2 手动 single irrigation amount",
-        )
-        .number(
-            SonoffSingleIrrigationConfigCluster.AttributeDefs.fail_safe_duration_min.name,
-            SonoffSingleIrrigationConfigCluster.cluster_id,
-            endpoint_id=2,
-            min_value=SINGLE_IRRIGATION_FAIL_SAFE_MIN,
-            max_value=SINGLE_IRRIGATION_FAIL_SAFE_MAX,
-            step=SINGLE_IRRIGATION_STEP_MIN,
-            device_class=NumberDeviceClass.DURATION,
-            unit=UnitOfTime.MINUTES,
-            mode="box",
-            translation_key="manual_ch2_single_irrigation_fail_safe_duration",
-            fallback_name="通道2 手动 single irrigation fail safe duration",
+            fallback_name="手动 05 fail safe duration",
         )
     )
 
@@ -1311,7 +1346,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_index",
-            fallback_name="通道1 日程 irrigation plan index",
+            fallback_name="通道1 日程 01 计划索引",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_year.name,
@@ -1321,7 +1356,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_year",
-            fallback_name="通道1 日程 effective year",
+            fallback_name="通道1 日程 02 生效年",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_month.name,
@@ -1331,7 +1366,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_month",
-            fallback_name="通道1 日程 effective month",
+            fallback_name="通道1 日程 03 生效月",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_day.name,
@@ -1341,14 +1376,14 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_day",
-            fallback_name="通道1 日程 effective day",
+            fallback_name="通道1 日程 04 生效日",
         )
         .enum(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.amount_unit.name,
             IrrigationAmountUnit,
             SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_amount_unit",
-            fallback_name="通道1 日程 irrigation amount unit",
+            fallback_name="通道1 日程 05 水量单位",
         )
         # 循环模式
         .enum(
@@ -1356,7 +1391,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             IrrigationPlanRepeat,
             SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_repeat_mode",
-            fallback_name="通道1 日程 repeat mode",
+            fallback_name="通道1 日程 06 重复模式",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.repeat_value.name,
@@ -1366,7 +1401,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_repeat_value",
-            fallback_name="通道1 日程 repeat value",
+            fallback_name="通道1 日程 07 重复值",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_monday.name,
@@ -1374,7 +1409,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_monday",
-            fallback_name="通道1 日程 Monday",
+            fallback_name="通道1 日程 08 周一",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_tuesday.name,
@@ -1382,7 +1417,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_tuesday",
-            fallback_name="通道1 日程 Tuesday",
+            fallback_name="通道1 日程 09 周二",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_wednesday.name,
@@ -1390,7 +1425,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_wednesday",
-            fallback_name="通道1 日程 Wednesday",
+            fallback_name="通道1 日程 10 周三",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_thursday.name,
@@ -1398,7 +1433,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_thursday",
-            fallback_name="通道1 日程 Thursday",
+            fallback_name="通道1 日程 11 周四",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_friday.name,
@@ -1406,7 +1441,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_friday",
-            fallback_name="通道1 日程 Friday",
+            fallback_name="通道1 日程 12 周五",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_saturday.name,
@@ -1414,7 +1449,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_saturday",
-            fallback_name="通道1 日程 Saturday",
+            fallback_name="通道1 日程 13 周六",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_sunday.name,
@@ -1422,7 +1457,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_sunday",
-            fallback_name="通道1 日程 Sunday",
+            fallback_name="通道1 日程 14 周日",
         )
         # 开始时间：时
         .number(
@@ -1433,7 +1468,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_start_hour",
-            fallback_name="通道1 日程 start hour",
+            fallback_name="通道1 日程 15 开始时",
         )
         # 开始时间：分
         .number(
@@ -1444,21 +1479,21 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_start_minute",
-            fallback_name="通道1 日程 start minute",
+            fallback_name="通道1 日程 16 开始分",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.name,
             SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.id,
             cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_set",
-            fallback_name="通道1 日程设置",
+            fallback_name="通道1 日程 17 设置",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.name,
             SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.id,
             cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_remove",
-            fallback_name="通道1 日程删除",
+            fallback_name="通道1 日程 18 删除",
         )
     )
 
@@ -1477,7 +1512,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_index",
-            fallback_name="通道2 日程 irrigation plan index",
+            fallback_name="通道2 日程 01 计划索引",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_year.name,
@@ -1488,7 +1523,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_year",
-            fallback_name="通道2 日程 effective year",
+            fallback_name="通道2 日程 02 生效年",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_month.name,
@@ -1499,7 +1534,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_month",
-            fallback_name="通道2 日程 effective month",
+            fallback_name="通道2 日程 03 生效月",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_day.name,
@@ -1510,17 +1545,9 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_day",
-            fallback_name="通道2 日程 effective day",
+            fallback_name="通道2 日程 04 生效日",
         )
-        .enum(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.amount_unit.name,
-            IrrigationAmountUnit,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-
-            translation_key="schedule_ch2_irrigation_amount_unit",
-            fallback_name="通道2 日程 irrigation amount unit",
-        )
+        # 通道2水量单位复用"手动灌溉"配置，不单独创建实体
         # 循环模式
         .enum(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.repeat_mode.name,
@@ -1528,7 +1555,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
             translation_key="schedule_ch2_irrigation_plan_repeat_mode",
-            fallback_name="通道2 日程 repeat mode",
+            fallback_name="通道2 日程 06 重复模式",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.repeat_value.name,
@@ -1539,7 +1566,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_repeat_value",
-            fallback_name="通道2 日程 repeat value",
+            fallback_name="通道2 日程 07 重复值",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_monday.name,
@@ -1548,7 +1575,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_monday",
-            fallback_name="通道2 日程 Monday",
+            fallback_name="通道2 日程 08 周一",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_tuesday.name,
@@ -1557,7 +1584,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_tuesday",
-            fallback_name="通道2 日程 Tuesday",
+            fallback_name="通道2 日程 09 周二",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_wednesday.name,
@@ -1566,7 +1593,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_wednesday",
-            fallback_name="通道2 日程 Wednesday",
+            fallback_name="通道2 日程 10 周三",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_thursday.name,
@@ -1575,7 +1602,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_thursday",
-            fallback_name="通道2 日程 Thursday",
+            fallback_name="通道2 日程 11 周四",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_friday.name,
@@ -1584,7 +1611,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_friday",
-            fallback_name="通道2 日程 Friday",
+            fallback_name="通道2 日程 12 周五",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_saturday.name,
@@ -1593,7 +1620,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_saturday",
-            fallback_name="通道2 日程 Saturday",
+            fallback_name="通道2 日程 13 周六",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_sunday.name,
@@ -1602,7 +1629,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_sunday",
-            fallback_name="通道2 日程 Sunday",
+            fallback_name="通道2 日程 14 周日",
         )
         # 开始时间：时
         .number(
@@ -1614,7 +1641,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_hour",
-            fallback_name="通道2 日程 start hour",
+            fallback_name="通道2 日程 15 开始时",
         )
         # 开始时间：分
         .number(
@@ -1626,7 +1653,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_minute",
-            fallback_name="通道2 日程 start minute",
+            fallback_name="通道2 日程 16 开始分",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.name,
@@ -1634,7 +1661,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             endpoint_id=2,
             cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             translation_key="schedule_ch2_irrigation_plan_set",
-            fallback_name="通道2 日程设置",
+            fallback_name="通道2 日程 17 设置",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.name,
@@ -1642,7 +1669,39 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             endpoint_id=2,
             cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             translation_key="schedule_ch2_irrigation_plan_remove",
-            fallback_name="通道2 日程删除",
+            fallback_name="通道2 日程 18 删除",
+        )
+    )
+
+# 添加用户延时（雨水延迟）实体
+def add_user_delay_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
+    """Add config entities for manual rain / user delay."""
+
+    return (
+        builder.adds(SonoffUserDelayConfigCluster)
+        .number(
+            SonoffUserDelayConfigCluster.AttributeDefs.delay_hours.name,
+            SonoffUserDelayConfigCluster.cluster_id,
+            min_value=1,
+            max_value=720,
+            step=1,
+            mode="box",
+            translation_key="manual_user_delay_hours",
+            fallback_name="延时 01 延时小时数",
+        )
+        .write_attr_button(
+            SonoffUserDelayConfigCluster.AttributeDefs.apply_delay.name,
+            SonoffUserDelayConfigCluster.AttributeDefs.apply_delay.id,
+            cluster_id=SonoffUserDelayConfigCluster.cluster_id,
+            translation_key="manual_user_delay_apply",
+            fallback_name="延时 02 应用延时",
+        )
+        .write_attr_button(
+            SonoffUserDelayConfigCluster.AttributeDefs.clear_delay.name,
+            SonoffUserDelayConfigCluster.AttributeDefs.clear_delay.id,
+            cluster_id=SonoffUserDelayConfigCluster.cluster_id,
+            translation_key="manual_user_delay_clear",
+            fallback_name="延时 03 清除延时",
         )
     )
 
@@ -1654,9 +1713,9 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
         SonoffWaterValveCluster, endpoint_id=2
     )
     builder = add_single_irrigation_config_entities(builder)
-    builder = add_single_irrigation_config_entities_ch2(builder)
     builder = add_irrigation_plan_config_entities(builder)
     builder = add_irrigation_plan_config_entities_ch2(builder)
+    builder = add_user_delay_config_entities(builder)
 
     return (
         builder
@@ -1665,14 +1724,27 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             IrrigationAmountUnit,
             SonoffSingleIrrigationConfigCluster.cluster_id,
             translation_key="manual_irrigation_amount_unit",
-            fallback_name="手动 irrigation amount unit",
+            fallback_name="手动 01 水量单位",
         )
         # 童锁
         .switch(
             SonoffWaterValveCluster.AttributeDefs.child_lock.name,
             SonoffWaterValveCluster.cluster_id,
             translation_key="child_lock",
-            fallback_name="Child lock",
+            fallback_name="童锁",
+        )
+        # 用户延时结束时间（0x5014）→ 转换为 Unix epoch 供 HA 显示
+        .sensor(
+            SonoffWaterValveCluster.AttributeDefs.user_delay_end_datetime.name,
+            SonoffWaterValveCluster.cluster_id,
+            device_class=SensorDeviceClass.TIMESTAMP,
+            state_class=SensorStateClass.MEASUREMENT,
+            reporting_config=ReportingConfig(
+                min_interval=30, max_interval=900, reportable_change=1
+            ),
+            attribute_converter=lambda v: v + ZIGBEE_EPOCH_OFFSET if v != 0 else None,
+            translation_key="user_delay_end_datetime",
+            fallback_name="用户延时结束时间",
         )
         # 1. 漏水传感器（bit1）
         .binary_sensor(
@@ -1685,7 +1757,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
                 min_interval=30, max_interval=900, reportable_change=1
             ),
             translation_key="water_leak",
-            fallback_name="Water leak",
+            fallback_name="漏水",
         )
         # 2. 缺水传感器（bit0）
         .binary_sensor(
@@ -1699,7 +1771,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
                 min_interval=30, max_interval=900, reportable_change=1
             ),
             translation_key="water_shortage",
-            fallback_name="Water shortage",
+            fallback_name="缺水",
         )
         # 实时灌溉时长
         .sensor(
@@ -1710,7 +1782,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.SECONDS,
             unique_id_suffix="realtime_irrigation_duration",
             translation_key="realtime_irrigation_duration",
-            fallback_name="Realtime irrigation duration",
+            fallback_name="实时灌溉时长",
             initially_disabled=True,
         )
         # 小时内灌溉时长
@@ -1725,7 +1797,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
                 min_interval=30, max_interval=900, reportable_change=1
             ),
             translation_key="hour_irrigation_duration",
-            fallback_name="Hour irrigation duration",
+            fallback_name="小时灌溉时长",
         )
         # 小时灌溉量
         .sensor(
@@ -1739,7 +1811,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
                 min_interval=30, max_interval=900, reportable_change=1
             ),
             translation_key="hour_irrigation_volume",
-            fallback_name="Hour irrigation volume",
+            fallback_name="小时灌溉水量",
         )
         # 日灌溉时长
         .sensor(
@@ -1750,7 +1822,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             unique_id_suffix="daily_irrigation_duration",
             translation_key="daily_irrigation_duration",
-            fallback_name="Daily irrigation duration",
+            fallback_name="日灌溉时长",
             initially_disabled=True,
         )
         # 日灌溉量
@@ -1762,7 +1834,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfVolume.LITERS,
             unique_id_suffix="daily_irrigation_volume",
             translation_key="daily_irrigation_volume",
-            fallback_name="Daily irrigation volume",
+            fallback_name="日灌溉水量",
             initially_disabled=True,
         )
     )
@@ -1779,6 +1851,8 @@ add_common_entities(
     .also_applies_to("SONOFF", "SWV-ZNE")
     .also_applies_to("SONOFF", "SWV-ZNU")
 ).add_to_registry()
+
+
 
 
 
