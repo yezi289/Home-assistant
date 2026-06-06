@@ -206,7 +206,7 @@ def _repeat_to_loop_info(repeat_mode: int, repeat_value: int) -> tuple[int, int]
         if not 1 <= repeat_value <= 30:
             raise ValueError("Irrigation plan interval must be between 1 and 30 days")
         return IrrigationLoopType.Days, repeat_value
-    if repeat_mode == IrrigationPlanRepeat.Custom:      # Custom cycle, repeat_value is weekday mask (0..127, bit0=Mon..bit6=Sun)
+    if repeat_mode == IrrigationPlanRepeat.Custom:      # Custom cycle, repeat_value is weekday mask (0..127, bit0=Sun, bit1=Mon..bit6=Sat)
         if not 0 <= repeat_value <= 0x7F:
             raise ValueError("Irrigation plan custom weekday mask must be 0..127")
         return IrrigationLoopType.Week, repeat_value
@@ -865,6 +865,8 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
         start_minute: Final = ZCLAttributeDef(id=0x002F, type=t.uint8_t)
         apply_plan: Final = ZCLAttributeDef(id=0x0030, type=t.uint8_t)
         remove_plan: Final = ZCLAttributeDef(id=0x0031, type=t.uint8_t)
+        duration_min: Final = ZCLAttributeDef(id=0x0036, type=t.uint16_t)
+        interval_duration_min: Final = ZCLAttributeDef(id=0x0037, type=t.uint16_t)
 
     # Initialize attribute values
     def __init__(self, *args, **kwargs):
@@ -882,6 +884,8 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
         self._start_minute = 0
         self._irrigation_mode = SingleIrrigationMode.Duration
         self._total_duration_min = SINGLE_IRRIGATION_DEFAULT_TOTAL_DURATION_MIN
+        self._duration_min = 0
+        self._interval_duration_min = 0
         self._amount = SINGLE_IRRIGATION_DEFAULT_AMOUNT
         self._fail_safe_duration_min = SINGLE_IRRIGATION_DEFAULT_FAIL_SAFE_DURATION_MIN
         self._applied_plan_signatures_by_index: dict[int, tuple[int, ...]] = {}
@@ -900,15 +904,17 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
             self.AttributeDefs.repeat_value.id: self._repeat_value,
             self.AttributeDefs.irrigation_mode.id: self._irrigation_mode,
             self.AttributeDefs.total_duration_min.id: self._total_duration_min,
+            self.AttributeDefs.duration_min.id: self._duration_min,
+            self.AttributeDefs.interval_duration_min.id: self._interval_duration_min,
             self.AttributeDefs.amount.id: self._amount,
             self.AttributeDefs.fail_safe_duration_min.id: self._fail_safe_duration_min,
-            self.AttributeDefs.weekday_monday.id: int(bool(self._weekday_mask & 0x01)),
-            self.AttributeDefs.weekday_tuesday.id: int(bool(self._weekday_mask & 0x02)),
-            self.AttributeDefs.weekday_wednesday.id: int(bool(self._weekday_mask & 0x04)),
-            self.AttributeDefs.weekday_thursday.id: int(bool(self._weekday_mask & 0x08)),
-            self.AttributeDefs.weekday_friday.id: int(bool(self._weekday_mask & 0x10)),
-            self.AttributeDefs.weekday_saturday.id: int(bool(self._weekday_mask & 0x20)),
-            self.AttributeDefs.weekday_sunday.id: int(bool(self._weekday_mask & 0x40)),
+            self.AttributeDefs.weekday_monday.id: int(bool(self._weekday_mask & 0x02)),
+            self.AttributeDefs.weekday_tuesday.id: int(bool(self._weekday_mask & 0x04)),
+            self.AttributeDefs.weekday_wednesday.id: int(bool(self._weekday_mask & 0x08)),
+            self.AttributeDefs.weekday_thursday.id: int(bool(self._weekday_mask & 0x10)),
+            self.AttributeDefs.weekday_friday.id: int(bool(self._weekday_mask & 0x20)),
+            self.AttributeDefs.weekday_saturday.id: int(bool(self._weekday_mask & 0x40)),
+            self.AttributeDefs.weekday_sunday.id: int(bool(self._weekday_mask & 0x01)),
             self.AttributeDefs.start_hour.id: self._start_hour,
             self.AttributeDefs.start_minute.id: self._start_minute,
         }
@@ -938,13 +944,19 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
 
         # Zero-out fields not applicable in the current irrigation mode
         plan_total_duration = self._total_duration_min
+        plan_duration = self._duration_min
+        plan_interval_duration = self._interval_duration_min
         plan_amount = self._amount
         plan_fail_safe = self._fail_safe_duration_min
         if self._irrigation_mode == SingleIrrigationMode.Volume:
             plan_total_duration = 0
+            plan_duration = 0
+            plan_interval_duration = 0
         elif self._irrigation_mode == SingleIrrigationMode.Duration:
             plan_amount = 0
             plan_fail_safe = 0
+            plan_duration = 0
+            plan_interval_duration = 0
 
         return IrrigationPlan(
             index=self._plan_index,
@@ -953,6 +965,8 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
             irrigation_mode=self._irrigation_mode,
             start_datetime=start_datetime,
             total_duration_min=plan_total_duration,
+            duration_min=plan_duration,
+            interval_duration_min=plan_interval_duration,
             amount_unit=amount_unit,
             amount=plan_amount,
             fail_safe_duration_min=plan_fail_safe,
@@ -1000,6 +1014,19 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     attr_def.name, value,
                 )
                 continue
+            if (
+                pending_mode != SingleIrrigationMode.Duration_With_Interval
+                and attr_id
+                in (
+                    self.AttributeDefs.duration_min.id,
+                    self.AttributeDefs.interval_duration_min.id,
+                )
+            ):
+                _LOGGER.warning(
+                    "Ignoring attribute %s=%s: only configurable in duration-with-interval mode",
+                    attr_def.name, value,
+                )
+                continue
             filtered_attributes[attr] = value
         if not filtered_attributes:
             return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
@@ -1026,24 +1053,28 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                 self._irrigation_mode = int(value)
             elif attr_id == self.AttributeDefs.total_duration_min.id:
                 self._total_duration_min = int(value)
+            elif attr_id == self.AttributeDefs.duration_min.id:
+                self._duration_min = int(value)
+            elif attr_id == self.AttributeDefs.interval_duration_min.id:
+                self._interval_duration_min = int(value)
             elif attr_id == self.AttributeDefs.amount.id:
                 self._amount = int(value)
             elif attr_id == self.AttributeDefs.fail_safe_duration_min.id:
                 self._fail_safe_duration_min = int(value)
             elif attr_id == self.AttributeDefs.weekday_monday.id:
-                self._weekday_mask = (self._weekday_mask & ~0x01) | int(bool(value))
-            elif attr_id == self.AttributeDefs.weekday_tuesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x02) | (int(bool(value)) << 1)
-            elif attr_id == self.AttributeDefs.weekday_wednesday.id:
+            elif attr_id == self.AttributeDefs.weekday_tuesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x04) | (int(bool(value)) << 2)
-            elif attr_id == self.AttributeDefs.weekday_thursday.id:
+            elif attr_id == self.AttributeDefs.weekday_wednesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x08) | (int(bool(value)) << 3)
-            elif attr_id == self.AttributeDefs.weekday_friday.id:
+            elif attr_id == self.AttributeDefs.weekday_thursday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x10) | (int(bool(value)) << 4)
-            elif attr_id == self.AttributeDefs.weekday_saturday.id:
+            elif attr_id == self.AttributeDefs.weekday_friday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x20) | (int(bool(value)) << 5)
-            elif attr_id == self.AttributeDefs.weekday_sunday.id:
+            elif attr_id == self.AttributeDefs.weekday_saturday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x40) | (int(bool(value)) << 6)
+            elif attr_id == self.AttributeDefs.weekday_sunday.id:
+                self._weekday_mask = (self._weekday_mask & ~0x01) | int(bool(value))
             elif attr_id == self.AttributeDefs.start_hour.id:
                 self._start_hour = int(value)
             elif attr_id == self.AttributeDefs.start_minute.id:
@@ -1115,6 +1146,8 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
         start_minute: Final = ZCLAttributeDef(id=0x004F, type=t.uint8_t)
         apply_plan: Final = ZCLAttributeDef(id=0x0050, type=t.uint8_t)
         remove_plan: Final = ZCLAttributeDef(id=0x0051, type=t.uint8_t)
+        duration_min: Final = ZCLAttributeDef(id=0x0056, type=t.uint16_t)
+        interval_duration_min: Final = ZCLAttributeDef(id=0x0057, type=t.uint16_t)
 
     def __init__(self, *args, **kwargs):
         """Initialize local schedule state."""
@@ -1131,6 +1164,8 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
         self._start_minute = 0
         self._irrigation_mode = SingleIrrigationMode.Duration
         self._total_duration_min = SINGLE_IRRIGATION_DEFAULT_TOTAL_DURATION_MIN
+        self._duration_min = 0
+        self._interval_duration_min = 0
         self._amount = SINGLE_IRRIGATION_DEFAULT_AMOUNT
         self._fail_safe_duration_min = SINGLE_IRRIGATION_DEFAULT_FAIL_SAFE_DURATION_MIN
         self._applied_plan_signatures_by_index: dict[int, tuple[int, ...]] = {}
@@ -1147,15 +1182,17 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             self.AttributeDefs.repeat_value.id: self._repeat_value,
             self.AttributeDefs.irrigation_mode.id: self._irrigation_mode,
             self.AttributeDefs.total_duration_min.id: self._total_duration_min,
+            self.AttributeDefs.duration_min.id: self._duration_min,
+            self.AttributeDefs.interval_duration_min.id: self._interval_duration_min,
             self.AttributeDefs.amount.id: self._amount,
             self.AttributeDefs.fail_safe_duration_min.id: self._fail_safe_duration_min,
-            self.AttributeDefs.weekday_monday.id: int(bool(self._weekday_mask & 0x01)),
-            self.AttributeDefs.weekday_tuesday.id: int(bool(self._weekday_mask & 0x02)),
-            self.AttributeDefs.weekday_wednesday.id: int(bool(self._weekday_mask & 0x04)),
-            self.AttributeDefs.weekday_thursday.id: int(bool(self._weekday_mask & 0x08)),
-            self.AttributeDefs.weekday_friday.id: int(bool(self._weekday_mask & 0x10)),
-            self.AttributeDefs.weekday_saturday.id: int(bool(self._weekday_mask & 0x20)),
-            self.AttributeDefs.weekday_sunday.id: int(bool(self._weekday_mask & 0x40)),
+            self.AttributeDefs.weekday_monday.id: int(bool(self._weekday_mask & 0x02)),
+            self.AttributeDefs.weekday_tuesday.id: int(bool(self._weekday_mask & 0x04)),
+            self.AttributeDefs.weekday_wednesday.id: int(bool(self._weekday_mask & 0x08)),
+            self.AttributeDefs.weekday_thursday.id: int(bool(self._weekday_mask & 0x10)),
+            self.AttributeDefs.weekday_friday.id: int(bool(self._weekday_mask & 0x20)),
+            self.AttributeDefs.weekday_saturday.id: int(bool(self._weekday_mask & 0x40)),
+            self.AttributeDefs.weekday_sunday.id: int(bool(self._weekday_mask & 0x01)),
             self.AttributeDefs.start_hour.id: self._start_hour,
             self.AttributeDefs.start_minute.id: self._start_minute,
         }
@@ -1182,13 +1219,19 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
 
         # Zero-out fields not applicable in the current irrigation mode
         plan_total_duration = self._total_duration_min
+        plan_duration = self._duration_min
+        plan_interval_duration = self._interval_duration_min
         plan_amount = self._amount
         plan_fail_safe = self._fail_safe_duration_min
         if self._irrigation_mode == SingleIrrigationMode.Volume:
             plan_total_duration = 0
+            plan_duration = 0
+            plan_interval_duration = 0
         elif self._irrigation_mode == SingleIrrigationMode.Duration:
             plan_amount = 0
             plan_fail_safe = 0
+            plan_duration = 0
+            plan_interval_duration = 0
 
         return IrrigationPlan(
             index=self._plan_index,
@@ -1197,6 +1240,8 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             irrigation_mode=self._irrigation_mode,
             start_datetime=start_datetime,
             total_duration_min=plan_total_duration,
+            duration_min=plan_duration,
+            interval_duration_min=plan_interval_duration,
             amount_unit=amount_unit,
             amount=plan_amount,
             fail_safe_duration_min=plan_fail_safe,
@@ -1243,6 +1288,19 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     attr_def.name, value,
                 )
                 continue
+            if (
+                pending_mode != SingleIrrigationMode.Duration_With_Interval
+                and attr_id
+                in (
+                    self.AttributeDefs.duration_min.id,
+                    self.AttributeDefs.interval_duration_min.id,
+                )
+            ):
+                _LOGGER.warning(
+                    "Ignoring attribute %s=%s: only configurable in duration-with-interval mode",
+                    attr_def.name, value,
+                )
+                continue
             filtered_attributes[attr] = value
         if not filtered_attributes:
             return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
@@ -1269,24 +1327,28 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                 self._irrigation_mode = int(value)
             elif attr_id == self.AttributeDefs.total_duration_min.id:
                 self._total_duration_min = int(value)
+            elif attr_id == self.AttributeDefs.duration_min.id:
+                self._duration_min = int(value)
+            elif attr_id == self.AttributeDefs.interval_duration_min.id:
+                self._interval_duration_min = int(value)
             elif attr_id == self.AttributeDefs.amount.id:
                 self._amount = int(value)
             elif attr_id == self.AttributeDefs.fail_safe_duration_min.id:
                 self._fail_safe_duration_min = int(value)
             elif attr_id == self.AttributeDefs.weekday_monday.id:
-                self._weekday_mask = (self._weekday_mask & ~0x01) | int(bool(value))
-            elif attr_id == self.AttributeDefs.weekday_tuesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x02) | (int(bool(value)) << 1)
-            elif attr_id == self.AttributeDefs.weekday_wednesday.id:
+            elif attr_id == self.AttributeDefs.weekday_tuesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x04) | (int(bool(value)) << 2)
-            elif attr_id == self.AttributeDefs.weekday_thursday.id:
+            elif attr_id == self.AttributeDefs.weekday_wednesday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x08) | (int(bool(value)) << 3)
-            elif attr_id == self.AttributeDefs.weekday_friday.id:
+            elif attr_id == self.AttributeDefs.weekday_thursday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x10) | (int(bool(value)) << 4)
-            elif attr_id == self.AttributeDefs.weekday_saturday.id:
+            elif attr_id == self.AttributeDefs.weekday_friday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x20) | (int(bool(value)) << 5)
-            elif attr_id == self.AttributeDefs.weekday_sunday.id:
+            elif attr_id == self.AttributeDefs.weekday_saturday.id:
                 self._weekday_mask = (self._weekday_mask & ~0x40) | (int(bool(value)) << 6)
+            elif attr_id == self.AttributeDefs.weekday_sunday.id:
+                self._weekday_mask = (self._weekday_mask & ~0x01) | int(bool(value))
             elif attr_id == self.AttributeDefs.start_hour.id:
                 self._start_hour = int(value)
             elif attr_id == self.AttributeDefs.start_minute.id:
@@ -1534,6 +1596,28 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             translation_key="schedule_ch1_irrigation_plan_effective_day",
             fallback_name="CH1 Schedule 05 effective day",
         )
+        # Start time: hour
+        .number(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.start_hour.name,
+            SonoffIrrigationPlanConfigCluster.cluster_id,
+            min_value=0,
+            max_value=23,
+            step=1,
+            mode="box",
+            translation_key="schedule_ch1_irrigation_plan_start_hour",
+            fallback_name="CH1 Schedule 06 start hour",
+        )
+        # Start time: minute
+        .number(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.start_minute.name,
+            SonoffIrrigationPlanConfigCluster.cluster_id,
+            min_value=0,
+            max_value=59,
+            step=1,
+            mode="box",
+            translation_key="schedule_ch1_irrigation_plan_start_minute",
+            fallback_name="CH1 Schedule 07 start minute",
+        )
         # Repeat mode
         .enum(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.repeat_mode.name,
@@ -1550,7 +1634,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_repeat_value",
-            fallback_name="CH1 Schedule 06 repeat value",
+            fallback_name="CH1 Schedule 08 repeat value",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_monday.name,
@@ -1558,7 +1642,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_monday",
-            fallback_name="CH1 Schedule 07 Monday",
+            fallback_name="CH1 Schedule 09 Monday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_tuesday.name,
@@ -1566,7 +1650,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_tuesday",
-            fallback_name="CH1 Schedule 08 Tuesday",
+            fallback_name="CH1 Schedule 10 Tuesday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_wednesday.name,
@@ -1574,7 +1658,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_wednesday",
-            fallback_name="CH1 Schedule 09 Wednesday",
+            fallback_name="CH1 Schedule 11 Wednesday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_thursday.name,
@@ -1582,7 +1666,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_thursday",
-            fallback_name="CH1 Schedule 10 Thursday",
+            fallback_name="CH1 Schedule 12 Thursday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_friday.name,
@@ -1590,7 +1674,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_friday",
-            fallback_name="CH1 Schedule 11 Friday",
+            fallback_name="CH1 Schedule 13 Friday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_saturday.name,
@@ -1598,7 +1682,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_saturday",
-            fallback_name="CH1 Schedule 12 Saturday",
+            fallback_name="CH1 Schedule 14 Saturday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_sunday.name,
@@ -1606,50 +1690,14 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_sunday",
-            fallback_name="CH1 Schedule 13 Sunday",
-        )
-        # Start time: hour
-        .number(
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.start_hour.name,
-            SonoffIrrigationPlanConfigCluster.cluster_id,
-            min_value=0,
-            max_value=23,
-            step=1,
-            mode="box",
-            translation_key="schedule_ch1_irrigation_plan_start_hour",
-            fallback_name="CH1 Schedule 14 start hour",
-        )
-        # Start time: minute
-        .number(
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.start_minute.name,
-            SonoffIrrigationPlanConfigCluster.cluster_id,
-            min_value=0,
-            max_value=59,
-            step=1,
-            mode="box",
-            translation_key="schedule_ch1_irrigation_plan_start_minute",
-            fallback_name="CH1 Schedule 15 start minute",
-        )
-        .write_attr_button(
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.name,
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.id,
-            cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
-            translation_key="schedule_ch1_irrigation_plan_set",
-            fallback_name="CH1 Schedule 16 apply plan",
-        )
-        .write_attr_button(
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.name,
-            SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.id,
-            cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
-            translation_key="schedule_ch1_irrigation_plan_remove",
-            fallback_name="CH1 Schedule 17 remove plan",
+            fallback_name="CH1 Schedule 15 Sunday",
         )
         .enum(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.irrigation_mode.name,
             SingleIrrigationMode,
             SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_mode",
-            fallback_name="CH1 Schedule 18 irrigation mode",
+            fallback_name="CH1 Schedule 16 irrigation mode",
             unique_id_suffix="schedule_ch1_irrigation_mode",
         )
         .number(
@@ -1662,7 +1710,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_total_duration",
-            fallback_name="CH1 Schedule 19 total duration",
+            fallback_name="CH1 Schedule 17 total duration",
             unique_id_suffix="schedule_ch1_total_duration",
         )
         .number(
@@ -1673,7 +1721,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_amount",
-            fallback_name="CH1 Schedule 20 amount",
+            fallback_name="CH1 Schedule 18 amount",
             unique_id_suffix="schedule_ch1_amount",
         )
         .number(
@@ -1686,8 +1734,48 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_fail_safe_duration",
-            fallback_name="CH1 Schedule 21 fail safe duration",
+            fallback_name="CH1 Schedule 19 fail safe duration",
             unique_id_suffix="schedule_ch1_fail_safe_duration",
+        )
+        .number(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.duration_min.name,
+            SonoffIrrigationPlanConfigCluster.cluster_id,
+            min_value=SINGLE_IRRIGATION_DURATION_MIN_MIN,
+            max_value=SINGLE_IRRIGATION_DURATION_MAX_MIN,
+            step=SINGLE_IRRIGATION_STEP_MIN,
+            device_class=NumberDeviceClass.DURATION,
+            unit=UnitOfTime.MINUTES,
+            mode="box",
+            translation_key="schedule_ch1_irrigation_duration",
+            fallback_name="CH1 Schedule 20 irrigation duration",
+            unique_id_suffix="schedule_ch1_irrigation_duration",
+        )
+        .number(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.interval_duration_min.name,
+            SonoffIrrigationPlanConfigCluster.cluster_id,
+            min_value=SINGLE_IRRIGATION_DURATION_MIN_MIN,
+            max_value=SINGLE_IRRIGATION_DURATION_MAX_MIN,
+            step=SINGLE_IRRIGATION_STEP_MIN,
+            device_class=NumberDeviceClass.DURATION,
+            unit=UnitOfTime.MINUTES,
+            mode="box",
+            translation_key="schedule_ch1_irrigation_interval_duration",
+            fallback_name="CH1 Schedule 21 irrigation interval duration",
+            unique_id_suffix="schedule_ch1_irrigation_interval_duration",
+        )
+        .write_attr_button(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.name,
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.id,
+            cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
+            translation_key="schedule_ch1_irrigation_plan_set",
+            fallback_name="CH1 Schedule 22 apply plan",
+        )
+        .write_attr_button(
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.name,
+            SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.id,
+            cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
+            translation_key="schedule_ch1_irrigation_plan_remove",
+            fallback_name="CH1 Schedule 23 remove plan",
         )
     )
 
@@ -1751,80 +1839,6 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             translation_key="schedule_ch2_irrigation_plan_repeat_mode",
             fallback_name="CH2 Schedule 01 repeat mode",
         )
-        .number(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.repeat_value.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            min_value=0,
-            max_value=30,
-            step=1,
-            mode="box",
-            translation_key="schedule_ch2_irrigation_plan_repeat_value",
-            fallback_name="CH2 Schedule 06 repeat value",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_monday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_monday",
-            fallback_name="CH2 Schedule 07 Monday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_tuesday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_tuesday",
-            fallback_name="CH2 Schedule 08 Tuesday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_wednesday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_wednesday",
-            fallback_name="CH2 Schedule 09 Wednesday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_thursday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_thursday",
-            fallback_name="CH2 Schedule 10 Thursday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_friday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_friday",
-            fallback_name="CH2 Schedule 11 Friday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_saturday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_saturday",
-            fallback_name="CH2 Schedule 12 Saturday",
-        )
-        .switch(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_sunday.name,
-            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            endpoint_id=2,
-            off_value=0,
-            on_value=1,
-            translation_key="schedule_ch2_irrigation_plan_sunday",
-            fallback_name="CH2 Schedule 13 Sunday",
-        )
         # Start time: hour
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.start_hour.name,
@@ -1835,7 +1849,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_hour",
-            fallback_name="CH2 Schedule 14 start hour",
+            fallback_name="CH2 Schedule 06 start hour",
         )
         # Start time: minute
         .number(
@@ -1847,23 +1861,81 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_minute",
-            fallback_name="CH2 Schedule 15 start minute",
+            fallback_name="CH2 Schedule 07 start minute",
         )
-        .write_attr_button(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.name,
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.id,
+        .number(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.repeat_value.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
-            cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            translation_key="schedule_ch2_irrigation_plan_set",
-            fallback_name="CH2 Schedule 16 apply plan",
+            min_value=0,
+            max_value=30,
+            step=1,
+            mode="box",
+            translation_key="schedule_ch2_irrigation_plan_repeat_value",
+            fallback_name="CH2 Schedule 08 repeat value",
         )
-        .write_attr_button(
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.name,
-            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.id,
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_monday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
-            cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
-            translation_key="schedule_ch2_irrigation_plan_remove",
-            fallback_name="CH2 Schedule 17 remove plan",
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_monday",
+            fallback_name="CH2 Schedule 09 Monday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_tuesday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_tuesday",
+            fallback_name="CH2 Schedule 10 Tuesday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_wednesday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_wednesday",
+            fallback_name="CH2 Schedule 11 Wednesday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_thursday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_thursday",
+            fallback_name="CH2 Schedule 12 Thursday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_friday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_friday",
+            fallback_name="CH2 Schedule 13 Friday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_saturday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_saturday",
+            fallback_name="CH2 Schedule 14 Saturday",
+        )
+        .switch(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_sunday.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            off_value=0,
+            on_value=1,
+            translation_key="schedule_ch2_irrigation_plan_sunday",
+            fallback_name="CH2 Schedule 15 Sunday",
         )
         # Schedule 2 independent irrigation config
         .enum(
@@ -1872,7 +1944,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
             translation_key="schedule_ch2_irrigation_mode",
-            fallback_name="CH2 Schedule 18 irrigation mode",
+            fallback_name="CH2 Schedule 16 irrigation mode",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.total_duration_min.name,
@@ -1885,7 +1957,33 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_total_duration",
-            fallback_name="CH2 Schedule 19 total duration",
+            fallback_name="CH2 Schedule 17 total duration",
+        )
+        .number(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.duration_min.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            min_value=SINGLE_IRRIGATION_DURATION_MIN_MIN,
+            max_value=SINGLE_IRRIGATION_DURATION_MAX_MIN,
+            step=SINGLE_IRRIGATION_STEP_MIN,
+            device_class=NumberDeviceClass.DURATION,
+            unit=UnitOfTime.MINUTES,
+            mode="box",
+            translation_key="schedule_ch2_irrigation_duration",
+            fallback_name="CH2 Schedule 20 irrigation duration",
+        )
+        .number(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.interval_duration_min.name,
+            SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            endpoint_id=2,
+            min_value=SINGLE_IRRIGATION_DURATION_MIN_MIN,
+            max_value=SINGLE_IRRIGATION_DURATION_MAX_MIN,
+            step=SINGLE_IRRIGATION_STEP_MIN,
+            device_class=NumberDeviceClass.DURATION,
+            unit=UnitOfTime.MINUTES,
+            mode="box",
+            translation_key="schedule_ch2_irrigation_interval_duration",
+            fallback_name="CH2 Schedule 21 irrigation interval duration",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.amount.name,
@@ -1896,7 +1994,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_amount",
-            fallback_name="CH2 Schedule 20 amount",
+            fallback_name="CH2 Schedule 18 amount",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.fail_safe_duration_min.name,
@@ -1909,7 +2007,23 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_fail_safe_duration",
-            fallback_name="CH2 Schedule 21 fail safe duration",
+            fallback_name="CH2 Schedule 19 fail safe duration",
+        )
+        .write_attr_button(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.name,
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.id,
+            endpoint_id=2,
+            cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            translation_key="schedule_ch2_irrigation_plan_set",
+            fallback_name="CH2 Schedule 22 apply plan",
+        )
+        .write_attr_button(
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.name,
+            SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.id,
+            endpoint_id=2,
+            cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
+            translation_key="schedule_ch2_irrigation_plan_remove",
+            fallback_name="CH2 Schedule 23 remove plan",
         )
     )
 
