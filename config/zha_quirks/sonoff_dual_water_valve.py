@@ -268,28 +268,6 @@ def encode_irrigation_plan_payload(plan: IrrigationPlan) -> bytes:
         raise ValueError("Irrigation plan payload must be 28 bytes")
     return bytes(payload)
 
-# Return the stable fields that identify a schedule plan (dedupe key)
-def irrigation_plan_dedupe_key(plan: IrrigationPlan) -> tuple[int, ...]:
-    """Return the stable fields that identify a schedule plan."""
-
-    _validate_irrigation_plan_index(plan.index)
-    loop_type, loop_option = _repeat_to_loop_info(plan.repeat_mode, plan.repeat_value)
-    return (
-        int(plan.enabled),
-        int(loop_type),
-        int(loop_option),
-        int(plan.enable_datetime),
-        int(plan.irrigation_mode),
-        int(plan.start_datetime),
-        int(plan.total_duration_min),
-        int(plan.duration_min),
-        int(plan.interval_duration_min),
-        int(plan.amount_unit),
-        int(plan.amount),
-        int(plan.fail_safe_duration_min),
-    )
-
-
 def single_irrigation_array_from_payload(
     payload: bytes | list[int],
 ) -> SingleIrrigationPayload:
@@ -748,7 +726,7 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
             filtered_attributes[attr] = value
         # All filtered, return success to avoid empty write
         if not filtered_attributes:
-            return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
+            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
         attributes = filtered_attributes
 
         for attr, value in attributes.items():
@@ -808,7 +786,7 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
                 self.AttributeDefs.fail_safe_duration_min.id,
                 self._single_irrigation_state.fail_safe_duration_min,
             )
-        return config_result if config_result is not None else [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
+        return config_result if config_result is not None else [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
 
     @staticmethod
     def _write_succeeded(result: list) -> bool:
@@ -888,7 +866,6 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
         self._interval_duration_min = 0
         self._amount = SINGLE_IRRIGATION_DEFAULT_AMOUNT
         self._fail_safe_duration_min = SINGLE_IRRIGATION_DEFAULT_FAIL_SAFE_DURATION_MIN
-        self._applied_plan_signatures_by_index: dict[int, tuple[int, ...]] = {}
         self._update_all_attributes()
         self._ui_date_year, self._ui_date_month, self._ui_date_day = now.year, now.month, now.day
 
@@ -952,11 +929,12 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
             plan_total_duration = 0
             plan_duration = 0
             plan_interval_duration = 0
-        elif self._irrigation_mode == SingleIrrigationMode.Duration:
+        elif self._irrigation_mode in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval):
             plan_amount = 0
             plan_fail_safe = 0
-            plan_duration = 0
-            plan_interval_duration = 0
+            if self._irrigation_mode == SingleIrrigationMode.Duration:
+                plan_duration = 0
+                plan_interval_duration = 0
 
         return IrrigationPlan(
             index=self._plan_index,
@@ -991,7 +969,8 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
             if attr_id == self.AttributeDefs.irrigation_mode.id:
                 pending_mode = int(value)
             if (
-                pending_mode == SingleIrrigationMode.Duration
+                pending_mode
+                in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval)
                 and attr_id
                 in (
                     self.AttributeDefs.amount.id,
@@ -1000,8 +979,8 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
             ):
                 _LOGGER.warning(
                     "Ignoring attribute %s=%s: only configurable in volume mode "
-                    "(device is in duration mode)",
-                    attr_def.name, value,
+                    "(device is in %s mode)",
+                    attr_def.name, value, pending_mode.name,
                 )
                 continue
             if (
@@ -1029,7 +1008,7 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                 continue
             filtered_attributes[attr] = value
         if not filtered_attributes:
-            return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
+            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
         attributes = filtered_attributes
 
         result = []
@@ -1081,9 +1060,6 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                 self._start_minute = int(value)
             elif attr_id == self.AttributeDefs.apply_plan.id:   # Set plan
                 plan = self._plan_from_current_config()
-                plan_signature = irrigation_plan_dedupe_key(plan)
-                if plan_signature in self._applied_plan_signatures_by_index.values():
-                    continue
                 payload = encode_irrigation_plan_payload(plan)
                 # Wrap payload in ZCL command and send to Zigbee device
                 result = await self.endpoint.sonoff_cluster.command(
@@ -1092,7 +1068,6 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     manufacturer=None,
                     expect_reply=False,
                 )
-                self._applied_plan_signatures_by_index[int(plan.index)] = plan_signature
             elif attr_id == self.AttributeDefs.remove_plan.id:  # Remove plan
                 _validate_irrigation_plan_index(self._plan_index)
                 # Wrap payload in ZCL command and send to Zigbee device
@@ -1102,7 +1077,6 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     manufacturer=None,
                     expect_reply=False,
                 )
-                self._applied_plan_signatures_by_index.pop(int(self._plan_index), None)
 
         self._update_all_attributes()
         if result:
@@ -1168,7 +1142,6 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
         self._interval_duration_min = 0
         self._amount = SINGLE_IRRIGATION_DEFAULT_AMOUNT
         self._fail_safe_duration_min = SINGLE_IRRIGATION_DEFAULT_FAIL_SAFE_DURATION_MIN
-        self._applied_plan_signatures_by_index: dict[int, tuple[int, ...]] = {}
         self._update_all_attributes()
 
     def _update_all_attributes(self) -> None:
@@ -1227,11 +1200,12 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             plan_total_duration = 0
             plan_duration = 0
             plan_interval_duration = 0
-        elif self._irrigation_mode == SingleIrrigationMode.Duration:
+        elif self._irrigation_mode in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval):
             plan_amount = 0
             plan_fail_safe = 0
-            plan_duration = 0
-            plan_interval_duration = 0
+            if self._irrigation_mode == SingleIrrigationMode.Duration:
+                plan_duration = 0
+                plan_interval_duration = 0
 
         return IrrigationPlan(
             index=self._plan_index,
@@ -1265,7 +1239,8 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             if attr_id == self.AttributeDefs.irrigation_mode.id:
                 pending_mode = int(value)
             if (
-                pending_mode == SingleIrrigationMode.Duration
+                pending_mode
+                in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval)
                 and attr_id
                 in (
                     self.AttributeDefs.amount.id,
@@ -1274,8 +1249,8 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
             ):
                 _LOGGER.warning(
                     "Ignoring attribute %s=%s: only configurable in volume mode "
-                    "(device is in duration mode)",
-                    attr_def.name, value,
+                    "(device is in %s mode)",
+                    attr_def.name, value, pending_mode.name,
                 )
                 continue
             if (
@@ -1303,7 +1278,7 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                 continue
             filtered_attributes[attr] = value
         if not filtered_attributes:
-            return [foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]
+            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
         attributes = filtered_attributes
 
         result = []
@@ -1355,9 +1330,6 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                 self._start_minute = int(value)
             elif attr_id == self.AttributeDefs.apply_plan.id:
                 plan = self._plan_from_current_config()
-                plan_signature = irrigation_plan_dedupe_key(plan)
-                if plan_signature in self._applied_plan_signatures_by_index.values():
-                    continue
                 payload = encode_irrigation_plan_payload(plan)
                 result = await self.endpoint.sonoff_cluster.command(
                     IRRIGATION_PLAN_SET_COMMAND_ID,
@@ -1365,7 +1337,6 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     manufacturer=None,
                     expect_reply=False,
                 )
-                self._applied_plan_signatures_by_index[int(plan.index)] = plan_signature
             elif attr_id == self.AttributeDefs.remove_plan.id:
                 _validate_irrigation_plan_index(self._plan_index)
                 result = await self.endpoint.sonoff_cluster.command(
@@ -1374,7 +1345,6 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     manufacturer=None,
                     expect_reply=False,
                 )
-                self._applied_plan_signatures_by_index.pop(int(self._plan_index), None)
 
         self._update_all_attributes()
         if result:
@@ -2090,7 +2060,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             reporting_config=ReportingConfig(
                 min_interval=30, max_interval=900, reportable_change=1
             ),
-            attribute_converter=lambda v: v + ZIGBEE_EPOCH_OFFSET if v != 0 else None,
+            attribute_converter=lambda v: datetime.fromtimestamp(v + ZIGBEE_EPOCH_OFFSET, tz=timezone.utc) if v != 0 else None,
             translation_key="user_delay_end_datetime",
             fallback_name="User delay end time",
         )
