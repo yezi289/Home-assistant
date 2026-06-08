@@ -52,6 +52,8 @@ IRRIGATION_PLAN_MAX_COUNT = 6
 IRRIGATION_PLAN_SET_COMMAND_ID = 0x06
 IRRIGATION_PLAN_REMOVE_COMMAND_ID = 0x07
 MANUAL_RAIN_DELAY_CONTROL = 0x08
+QUARTERLY_ADJUSTMENT_PAYLOAD_LEN = 12
+QUARTERLY_ADJUSTMENT_DEFAULT_VALUE = 10
 ZIGBEE_EPOCH_OFFSET = 946684800
 
 def _u16_be(data: bytes) -> int:
@@ -85,6 +87,25 @@ class IrrigationPlanPayload(t.FixedList):
 
     _item_type = t.uint8_t
     _length = IRRIGATION_PLAN_PAYLOAD_LEN
+
+
+class QuarterlyAdjustmentPayload(t.FixedList):
+    """Raw 12-byte quarterly adjustment payload."""
+
+    _item_type = t.uint8_t
+    _length = QUARTERLY_ADJUSTMENT_PAYLOAD_LEN
+
+
+class QuarterlyAdjustmentState:
+    """State container for seasonal watering adjustment."""
+
+    def __init__(self, values: list[int] | None = None):
+        self.values = list(values or [QUARTERLY_ADJUSTMENT_DEFAULT_VALUE] * QUARTERLY_ADJUSTMENT_PAYLOAD_LEN)
+        if len(self.values) != QUARTERLY_ADJUSTMENT_PAYLOAD_LEN:
+            raise ValueError("Quarterly adjustment state must contain 12 values")
+
+    def to_payload(self) -> bytes:
+        return bytes(int(value) for value in self.values)
 
 
 class SingleIrrigationPayload(t.LVList, item_type=t.uint8_t, length_type=t.uint16_t):
@@ -234,6 +255,15 @@ def _zigbee_now_timestamp() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() - ZIGBEE_EPOCH_OFFSET)
 
 
+def _local_timezone_offset_seconds() -> int:
+    """Return the local runtime timezone offset in seconds."""
+
+    offset = datetime.now().astimezone().utcoffset()
+    if offset is None:
+        return 0
+    return int(offset.total_seconds())
+
+
 # Convert Zigbee epoch timestamp to year/month/day tuple
 def _zigbee_timestamp_to_ymd(value: int) -> tuple[int, int, int]:
     """Convert a Zigbee epoch timestamp to year/month/day."""
@@ -284,6 +314,36 @@ def single_irrigation_array_from_payload_test(
         type=SINGLE_IRRIGATION_ARRAY_ITEM_TYPE,
         value=t.LVList[t.uint8_t, t.uint16_t](payload),
     )
+
+def quarterly_adjustment_payload_from_value(value: Any) -> bytes:
+    """Normalize quarterly adjustment input to 12 raw bytes."""
+
+    if isinstance(value, foundation.Array):
+        value = value.value
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif isinstance(value, t.LVList):
+        data = bytes(value)
+    elif isinstance(value, list):
+        data = bytes(int(item) for item in value)
+    else:
+        raise ValueError("Unsupported quarterly adjustment payload value")
+    if len(data) != QUARTERLY_ADJUSTMENT_PAYLOAD_LEN:
+        raise ValueError("Quarterly adjustment payload must be 12 bytes")
+    return data
+
+
+def quarterly_adjustment_array_from_payload(
+    payload: bytes | list[int] | foundation.Array,
+) -> foundation.Array:
+    """Wrap a quarterly adjustment payload in a ZCL array value."""
+
+    data = quarterly_adjustment_payload_from_value(payload)
+    return foundation.Array(
+        type=SINGLE_IRRIGATION_ARRAY_ITEM_TYPE,
+        value=t.LVList[t.uint8_t, t.uint16_t](data),
+    )
+
 
 # Unpack ZCL array to single irrigation payload
 def single_irrigation_payload_from_array(value: Any) -> bytes:
@@ -467,6 +527,12 @@ class SonoffWaterValveCluster(CustomCluster):
             type=SingleIrrigationPayload,
             manufacturer_code=None,
         )
+        # Seasonal adjustment attribute definition
+        quarterly_adjustment = ZCLAttributeDef(
+            id=0x501E,
+            type=foundation.Array,
+            manufacturer_code=None,
+        )
         # Water flow unit attribute definition
         unit_of_water_flow = ZCLAttributeDef(
             id=0x5021,
@@ -479,6 +545,7 @@ class SonoffWaterValveCluster(CustomCluster):
 
         super().__init__(*args, **kwargs)
         self._single_irrigation_state = SingleIrrigationState()
+        self._quarterly_adjustment = QuarterlyAdjustmentState()
         self.on_event(
             AttributeReadEvent.event_type, self._handle_single_irrigation_change
         )
@@ -490,6 +557,18 @@ class SonoffWaterValveCluster(CustomCluster):
         )
         self.on_event(
             AttributeWrittenEvent.event_type, self._handle_single_irrigation_change
+        )
+        self.on_event(
+            AttributeReadEvent.event_type, self._handle_quarterly_adjustment_change
+        )
+        self.on_event(
+            AttributeReportedEvent.event_type, self._handle_quarterly_adjustment_change
+        )
+        self.on_event(
+            AttributeUpdatedEvent.event_type, self._handle_quarterly_adjustment_change
+        )
+        self.on_event(
+            AttributeWrittenEvent.event_type, self._handle_quarterly_adjustment_change
         )
 
     # Handle single irrigation attribute changes
@@ -538,6 +617,38 @@ class SonoffWaterValveCluster(CustomCluster):
                 self._single_irrigation_state
             )
 
+    def _handle_quarterly_adjustment_change(
+        self,
+        event: AttributeReadEvent
+        | AttributeReportedEvent
+        | AttributeUpdatedEvent
+        | AttributeWrittenEvent,
+    ) -> None:
+        """Sync quarterly adjustment to the local config cluster."""
+        if isinstance(event, AttributeWrittenEvent) and event.status != Status.SUCCESS:
+            return
+        if event.attribute_id != self.AttributeDefs.quarterly_adjustment.id:
+            return
+
+        values = [event.value]
+        if isinstance(event, AttributeReadEvent) and event.raw_value is not event.value:
+            values.append(event.raw_value)
+
+        for value in values:
+            try:
+                payload = quarterly_adjustment_payload_from_value(value)
+                self._quarterly_adjustment = QuarterlyAdjustmentState(list(payload))
+                break
+            except (TypeError, ValueError):
+                continue
+        else:
+            return
+
+        if hasattr(self.endpoint, "sonoff_seasonal_adjustment_config"):
+            self.endpoint.sonoff_seasonal_adjustment_config.update_quarterly_adjustment(
+                self._quarterly_adjustment.values
+            )
+
     async def apply_custom_configuration(self, *args, **kwargs):
         """Read single irrigation configuration during pairing."""
 
@@ -577,14 +688,29 @@ class SonoffAmountUnitConfigCluster(LocalDataCluster):
         attributes: dict[str | int | ZCLAttributeDef, Any],
         **kwargs,
     ) -> list:
-        """When user changes the amount unit, write the aggregate 0x501D."""
+        """When user changes the amount unit, write 0x5021 to the device."""
+        result = None
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
             if attr_id == self.AttributeDefs.amount_unit.id:
                 self._amount_unit = int(value)
                 self._update_attribute(attr_id, self._amount_unit)
+                # Write 0x5021 to the real SONOFF private cluster on endpoint 1
+                result = await self.endpoint.sonoff_cluster.write_attributes_raw(
+                    [
+                        foundation.Attribute(
+                            attrid=SonoffWaterValveCluster.AttributeDefs.unit_of_water_flow.id,
+                            value=foundation.TypeValue(
+                                type=foundation.DataTypeId.uint8,
+                                value=t.uint8_t(self._amount_unit),
+                            ),
+                        )
+                    ]
+                )
 
+        if result is not None:
+            return result
         return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
 
 
@@ -980,7 +1106,7 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                 _LOGGER.warning(
                     "Ignoring attribute %s=%s: only configurable in volume mode "
                     "(device is in %s mode)",
-                    attr_def.name, value, pending_mode.name,
+                    attr_def.name, value, SingleIrrigationMode(pending_mode).name,
                 )
                 continue
             if (
@@ -1250,7 +1376,7 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                 _LOGGER.warning(
                     "Ignoring attribute %s=%s: only configurable in volume mode "
                     "(device is in %s mode)",
-                    attr_def.name, value, pending_mode.name,
+                    attr_def.name, value, SingleIrrigationMode(pending_mode).name,
                 )
                 continue
             if (
@@ -1369,6 +1495,7 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
         """Local user-delay configuration attributes."""
 
         delay_hours: Final = ZCLAttributeDef(id=0x0060, type=t.uint8_t)
+        timezone_offset_hours: Final = ZCLAttributeDef(id=0x0063, type=t.int8s)
         apply_delay: Final = ZCLAttributeDef(id=0x0061, type=t.uint8_t)
         clear_delay: Final = ZCLAttributeDef(id=0x0062, type=t.uint8_t)
 
@@ -1376,14 +1503,19 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
         """Initialise with sensible defaults and listen for firmware reports."""
         super().__init__(*args, **kwargs)
         self._delay_hours: int = 24
+        self._timezone_offset_hours: int = int(_local_timezone_offset_seconds() / 3600)
         self._update_attribute(self.AttributeDefs.delay_hours.id, self._delay_hours)
+        self._update_attribute(
+            self.AttributeDefs.timezone_offset_hours.id,
+            self._timezone_offset_hours,
+        )
 
     async def write_attributes(
         self,
         attributes: dict[str | int | ZCLAttributeDef, Any],
         **_kwargs: Any,
     ) -> list:
-        """Handle local writes: cache delay_hours, trigger apply/clear via
+        """Handle local writes: cache delay_hours/timezone_offset, trigger apply/clear via
         command 0x08 on the real SONOFF cluster."""
 
         result = []
@@ -1393,9 +1525,16 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
             if attr_id == self.AttributeDefs.delay_hours.id:
                 self._delay_hours = int(value)
                 self._update_attribute(attr_id, self._delay_hours)
+            elif attr_id == self.AttributeDefs.timezone_offset_hours.id:
+                self._timezone_offset_hours = max(-12, min(int(value), 14))
+                self._update_attribute(attr_id, self._timezone_offset_hours)
             elif attr_id == self.AttributeDefs.apply_delay.id:
                 now_zigbee = _zigbee_now_timestamp()
-                end_timestamp = now_zigbee + self._delay_hours * 3600
+                end_timestamp = (
+                    now_zigbee
+                    + self._timezone_offset_hours * 3600
+                    + self._delay_hours * 3600
+                )
                 result = await self.endpoint.sonoff_cluster.command(
                     MANUAL_RAIN_DELAY_CONTROL,
                     delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
@@ -1417,6 +1556,94 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
         return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
 
 
+#****************************** Seasonal adjustment (global) start *****************************************************
+
+class SonoffSeasonalAdjustmentConfigCluster(LocalDataCluster):
+    """Local cluster for seasonal (monthly) watering adjustment — global, shared by all channels."""
+
+    cluster_id = 0xFAFE
+    ep_attribute = "sonoff_seasonal_adjustment_config"
+
+    class AttributeDefs(BaseAttributeDefs):
+        """Monthly seasonal adjustment attributes."""
+
+        seasonal_adjustment_january: Final = ZCLAttributeDef(id=0x0080, type=t.uint8_t)
+        seasonal_adjustment_february: Final = ZCLAttributeDef(id=0x0081, type=t.uint8_t)
+        seasonal_adjustment_march: Final = ZCLAttributeDef(id=0x0082, type=t.uint8_t)
+        seasonal_adjustment_april: Final = ZCLAttributeDef(id=0x0083, type=t.uint8_t)
+        seasonal_adjustment_may: Final = ZCLAttributeDef(id=0x0084, type=t.uint8_t)
+        seasonal_adjustment_june: Final = ZCLAttributeDef(id=0x0085, type=t.uint8_t)
+        seasonal_adjustment_july: Final = ZCLAttributeDef(id=0x0086, type=t.uint8_t)
+        seasonal_adjustment_august: Final = ZCLAttributeDef(id=0x0087, type=t.uint8_t)
+        seasonal_adjustment_september: Final = ZCLAttributeDef(id=0x0088, type=t.uint8_t)
+        seasonal_adjustment_october: Final = ZCLAttributeDef(id=0x0089, type=t.uint8_t)
+        seasonal_adjustment_november: Final = ZCLAttributeDef(id=0x008A, type=t.uint8_t)
+        seasonal_adjustment_december: Final = ZCLAttributeDef(id=0x008B, type=t.uint8_t)
+
+    def __init__(self, *args, **kwargs):
+        """Initialize with default quarterly adjustment values."""
+        super().__init__(*args, **kwargs)
+        self._quarterly_adjustment = QuarterlyAdjustmentState()
+        self._update_all_attributes()
+
+    def _monthly_attr_defs(self) -> tuple[ZCLAttributeDef, ...]:
+        """Return monthly seasonal adjustment attributes in month order."""
+        return (
+            self.AttributeDefs.seasonal_adjustment_january,
+            self.AttributeDefs.seasonal_adjustment_february,
+            self.AttributeDefs.seasonal_adjustment_march,
+            self.AttributeDefs.seasonal_adjustment_april,
+            self.AttributeDefs.seasonal_adjustment_may,
+            self.AttributeDefs.seasonal_adjustment_june,
+            self.AttributeDefs.seasonal_adjustment_july,
+            self.AttributeDefs.seasonal_adjustment_august,
+            self.AttributeDefs.seasonal_adjustment_september,
+            self.AttributeDefs.seasonal_adjustment_october,
+            self.AttributeDefs.seasonal_adjustment_november,
+            self.AttributeDefs.seasonal_adjustment_december,
+        )
+
+    def _update_all_attributes(self) -> None:
+        """Mirror the local quarterly adjustment state into entity attributes."""
+        for attr_def, value in zip(
+            self._monthly_attr_defs(),
+            self._quarterly_adjustment.values,
+            strict=False,
+        ):
+            self._update_attribute(attr_def.id, value)
+
+    def update_quarterly_adjustment(self, values: list[int]) -> None:
+        """Update local monthly seasonal adjustment state from device report."""
+        self._quarterly_adjustment = QuarterlyAdjustmentState(values)
+        self._update_all_attributes()
+
+    async def write_attributes(
+        self,
+        attributes: dict[str | int | ZCLAttributeDef, Any],
+        **kwargs,
+    ) -> list:
+        """Write a single month's adjustment value, merging into the full 12-byte array."""
+        values = list(self._quarterly_adjustment.values)
+        for attr, value in attributes.items():
+            attr_def = self.find_attribute(attr)
+            for index, month_def in enumerate(self._monthly_attr_defs()):
+                if attr_def.id == month_def.id:
+                    values[index] = int(value)
+                    break
+        self._quarterly_adjustment = QuarterlyAdjustmentState(values)
+        result = await self.endpoint.sonoff_cluster.write_attributes(
+            {
+                SonoffWaterValveCluster.AttributeDefs.quarterly_adjustment.id: quarterly_adjustment_array_from_payload(
+                    self._quarterly_adjustment.to_payload()
+                )
+            }
+        )
+        self._update_all_attributes()
+        if result:
+            return result
+        return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
+
+
 #****************************** Amount unit entity (global) start *****************************************************
 
 def add_amount_unit_config_entity(builder: QuirkBuilder) -> QuirkBuilder:
@@ -1428,8 +1655,139 @@ def add_amount_unit_config_entity(builder: QuirkBuilder) -> QuirkBuilder:
             SonoffAmountUnitConfigCluster.AttributeDefs.amount_unit.name,
             IrrigationAmountUnit,
             SonoffAmountUnitConfigCluster.cluster_id,
+            entity_type=EntityType.CONFIG,
             translation_key="irrigation_amount_unit",
-            fallback_name="Global amount unit",
+            fallback_name="2.1 Capacity Units",
+        )
+    )
+
+
+#****************************** Seasonal adjustment entities start *****************************************************
+
+def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
+    """Add seasonal (monthly) watering adjustment config entities — global, shared by all channels."""
+
+    return (
+        builder.adds(SonoffSeasonalAdjustmentConfigCluster)
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_january.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_january",
+            fallback_name="7.1 Schedule seasonal adjustment january",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_february.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_february",
+            fallback_name="7.2 Schedule seasonal adjustment february",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_march.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_march",
+            fallback_name="7.3 Schedule seasonal adjustment march",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_april.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_april",
+            fallback_name="7.4 Schedule seasonal adjustment april",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_may.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_may",
+            fallback_name="7.5 Schedule seasonal adjustment may",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_june.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_june",
+            fallback_name="7.6 Schedule seasonal adjustment june",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_july.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_july",
+            fallback_name="7.7 Schedule seasonal adjustment july",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_august.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_august",
+            fallback_name="7.8 Schedule seasonal adjustment august",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_september.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_september",
+            fallback_name="7.9 Schedule seasonal adjustment september",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_october.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_october",
+            fallback_name="7.10 Schedule seasonal adjustment october",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_november.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_november",
+            fallback_name="7.11 Schedule seasonal adjustment november",
+        )
+        .number(
+            SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_december.name,
+            SonoffSeasonalAdjustmentConfigCluster.cluster_id,
+            min_value=1,
+            max_value=20,
+            step=1,
+            mode="box",
+            translation_key="schedule_seasonal_adjustment_december",
+            fallback_name="7.12 Schedule seasonal adjustment december",
         )
     )
 
@@ -1447,7 +1805,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             SonoffSingleIrrigationConfigCluster.cluster_id,
             entity_type=EntityType.CONFIG,
             translation_key="manual_single_irrigation_mode",
-            fallback_name="Manual 01 irrigation mode",
+            fallback_name="3.1 Manual irrigation mode",
         )
         .number(
             SonoffSingleIrrigationConfigCluster.AttributeDefs.total_duration_min.name,
@@ -1460,7 +1818,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="manual_single_irrigation_total_duration",
-            fallback_name="Manual 02 irrigation total duration",
+            fallback_name="3.2 Manual irrigation duration",
         )
         # .number(
         #     SonoffSingleIrrigationConfigCluster.AttributeDefs.duration_min.name,
@@ -1503,7 +1861,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             mode="box",
             # entity_type=EntityType.CONFIG,
             translation_key="manual_single_irrigation_amount",
-            fallback_name="Manual 03 irrigation amount",
+            fallback_name="3.3 Manual irrigation amount",
         )
         .number(
             SonoffSingleIrrigationConfigCluster.AttributeDefs.fail_safe_duration_min.name,
@@ -1516,7 +1874,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="manual_single_irrigation_fail_safe_duration",
-            fallback_name="Manual 04 fail safe duration",
+            fallback_name="3.4 Manual irrigation fail-safe time",
         )
     )
 
@@ -1534,7 +1892,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_index",
-            fallback_name="CH1 Schedule 02 plan index",
+            fallback_name="5.1 CH1 Schedule plan index",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_year.name,
@@ -1544,7 +1902,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_year",
-            fallback_name="CH1 Schedule 03 effective year",
+            fallback_name="5.2 CH1 Schedule effective year",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_month.name,
@@ -1554,7 +1912,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_month",
-            fallback_name="CH1 Schedule 04 effective month",
+            fallback_name="5.3 CH1 Schedule effective month",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.effective_day.name,
@@ -1564,7 +1922,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_effective_day",
-            fallback_name="CH1 Schedule 05 effective day",
+            fallback_name="5.4 CH1 Schedule effective day",
         )
         # Start time: hour
         .number(
@@ -1575,7 +1933,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_start_hour",
-            fallback_name="CH1 Schedule 06 start hour",
+            fallback_name="5.5 CH1 Schedule start hour",
         )
         # Start time: minute
         .number(
@@ -1586,7 +1944,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_start_minute",
-            fallback_name="CH1 Schedule 07 start minute",
+            fallback_name="5.6 CH1 Schedule start minute",
         )
         # Repeat mode
         .enum(
@@ -1594,7 +1952,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             IrrigationPlanRepeat,
             SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_repeat_mode",
-            fallback_name="CH1 Schedule 01 repeat mode",
+            fallback_name="5.7 CH1 Schedule repeat mode",
         )
         .number(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.repeat_value.name,
@@ -1604,7 +1962,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_irrigation_plan_repeat_value",
-            fallback_name="CH1 Schedule 08 repeat value",
+            fallback_name="5.8 CH1 Schedule repeat value",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_monday.name,
@@ -1612,7 +1970,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_monday",
-            fallback_name="CH1 Schedule 09 Monday",
+            fallback_name="5.9 CH1 Schedule Monday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_tuesday.name,
@@ -1620,7 +1978,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_tuesday",
-            fallback_name="CH1 Schedule 10 Tuesday",
+            fallback_name="5.10 CH1 Schedule Tuesday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_wednesday.name,
@@ -1628,7 +1986,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_wednesday",
-            fallback_name="CH1 Schedule 11 Wednesday",
+            fallback_name="5.11 CH1 Schedule Wednesday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_thursday.name,
@@ -1636,7 +1994,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_thursday",
-            fallback_name="CH1 Schedule 12 Thursday",
+            fallback_name="5.12 CH1 Schedule Thursday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_friday.name,
@@ -1644,7 +2002,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_friday",
-            fallback_name="CH1 Schedule 13 Friday",
+            fallback_name="5.13 CH1 Schedule Friday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_saturday.name,
@@ -1652,7 +2010,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_saturday",
-            fallback_name="CH1 Schedule 14 Saturday",
+            fallback_name="5.14 CH1 Schedule Saturday",
         )
         .switch(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.weekday_sunday.name,
@@ -1660,14 +2018,14 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             off_value=0,
             on_value=1,
             translation_key="schedule_ch1_irrigation_plan_sunday",
-            fallback_name="CH1 Schedule 15 Sunday",
+            fallback_name="5.15 CH1 Schedule Sunday",
         )
         .enum(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.irrigation_mode.name,
             SingleIrrigationMode,
             SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_mode",
-            fallback_name="CH1 Schedule 16 irrigation mode",
+            fallback_name="5.16 CH1 Schedule irrigation mode",
             unique_id_suffix="schedule_ch1_irrigation_mode",
         )
         .number(
@@ -1680,7 +2038,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_total_duration",
-            fallback_name="CH1 Schedule 17 total duration",
+            fallback_name="5.17 CH1 Schedule total duration",
             unique_id_suffix="schedule_ch1_total_duration",
         )
         .number(
@@ -1691,7 +2049,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_ch1_amount",
-            fallback_name="CH1 Schedule 18 amount",
+            fallback_name="5.18 CH1 Schedule amount",
             unique_id_suffix="schedule_ch1_amount",
         )
         .number(
@@ -1704,7 +2062,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_fail_safe_duration",
-            fallback_name="CH1 Schedule 19 fail safe duration",
+            fallback_name="5.19 CH1 Schedule fail safe duration",
             unique_id_suffix="schedule_ch1_fail_safe_duration",
         )
         .number(
@@ -1717,7 +2075,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_irrigation_duration",
-            fallback_name="CH1 Schedule 20 irrigation duration",
+            fallback_name="5.20 CH1 Schedule irrigation duration",
             unique_id_suffix="schedule_ch1_irrigation_duration",
         )
         .number(
@@ -1730,7 +2088,7 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch1_irrigation_interval_duration",
-            fallback_name="CH1 Schedule 21 irrigation interval duration",
+            fallback_name="5.21 CH1 Schedule interval duration",
             unique_id_suffix="schedule_ch1_irrigation_interval_duration",
         )
         .write_attr_button(
@@ -1738,14 +2096,14 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.id,
             cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_set",
-            fallback_name="CH1 Schedule 22 apply plan",
+            fallback_name="5.22 CH1 Schedule apply plan",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.name,
             SonoffIrrigationPlanConfigCluster.AttributeDefs.remove_plan.id,
             cluster_id=SonoffIrrigationPlanConfigCluster.cluster_id,
             translation_key="schedule_ch1_irrigation_plan_remove",
-            fallback_name="CH1 Schedule 23 remove plan",
+            fallback_name="5.23 CH1 Schedule remove plan",
         )
     )
 
@@ -1764,7 +2122,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_index",
-            fallback_name="CH2 Schedule 02 plan index",
+            fallback_name="6.1 CH2 Schedule plan index",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_year.name,
@@ -1775,7 +2133,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_year",
-            fallback_name="CH2 Schedule 03 effective year",
+            fallback_name="6.2 CH2 Schedule effective year",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_month.name,
@@ -1786,7 +2144,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_month",
-            fallback_name="CH2 Schedule 04 effective month",
+            fallback_name="6.3 CH2 Schedule effective month",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.effective_day.name,
@@ -1797,7 +2155,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_effective_day",
-            fallback_name="CH2 Schedule 05 effective day",
+            fallback_name="6.4 CH2 Schedule effective day",
         )
 
         # Repeat mode
@@ -1807,7 +2165,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
             translation_key="schedule_ch2_irrigation_plan_repeat_mode",
-            fallback_name="CH2 Schedule 01 repeat mode",
+            fallback_name="6.5 CH2 Schedule repeat mode",
         )
         # Start time: hour
         .number(
@@ -1819,7 +2177,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_hour",
-            fallback_name="CH2 Schedule 06 start hour",
+            fallback_name="6.6 CH2 Schedule start hour",
         )
         # Start time: minute
         .number(
@@ -1831,7 +2189,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_start_minute",
-            fallback_name="CH2 Schedule 07 start minute",
+            fallback_name="6.7 CH2 Schedule start minute",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.repeat_value.name,
@@ -1842,7 +2200,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_irrigation_plan_repeat_value",
-            fallback_name="CH2 Schedule 08 repeat value",
+            fallback_name="6.8 CH2 Schedule repeat value",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_monday.name,
@@ -1851,7 +2209,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_monday",
-            fallback_name="CH2 Schedule 09 Monday",
+            fallback_name="6.9 CH2 Schedule Monday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_tuesday.name,
@@ -1860,7 +2218,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_tuesday",
-            fallback_name="CH2 Schedule 10 Tuesday",
+            fallback_name="6.10 CH2 Schedule Tuesday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_wednesday.name,
@@ -1869,7 +2227,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_wednesday",
-            fallback_name="CH2 Schedule 11 Wednesday",
+            fallback_name="6.11 CH2 Schedule Wednesday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_thursday.name,
@@ -1878,7 +2236,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_thursday",
-            fallback_name="CH2 Schedule 12 Thursday",
+            fallback_name="6.12 CH2 Schedule Thursday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_friday.name,
@@ -1887,7 +2245,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_friday",
-            fallback_name="CH2 Schedule 13 Friday",
+            fallback_name="6.13 CH2 Schedule Friday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_saturday.name,
@@ -1896,7 +2254,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_saturday",
-            fallback_name="CH2 Schedule 14 Saturday",
+            fallback_name="6.14 CH2 Schedule Saturday",
         )
         .switch(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.weekday_sunday.name,
@@ -1905,7 +2263,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             off_value=0,
             on_value=1,
             translation_key="schedule_ch2_irrigation_plan_sunday",
-            fallback_name="CH2 Schedule 15 Sunday",
+            fallback_name="6.15 CH2 Schedule Sunday",
         )
         # Schedule 2 independent irrigation config
         .enum(
@@ -1914,7 +2272,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             endpoint_id=2,
             translation_key="schedule_ch2_irrigation_mode",
-            fallback_name="CH2 Schedule 16 irrigation mode",
+            fallback_name="6.16 CH2 Schedule irrigation mode",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.total_duration_min.name,
@@ -1927,7 +2285,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_total_duration",
-            fallback_name="CH2 Schedule 17 total duration",
+            fallback_name="6.17 CH2 Schedule total duration",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.duration_min.name,
@@ -1940,7 +2298,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_irrigation_duration",
-            fallback_name="CH2 Schedule 20 irrigation duration",
+            fallback_name="6.18 CH2 Schedule irrigation duration",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.interval_duration_min.name,
@@ -1953,7 +2311,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_irrigation_interval_duration",
-            fallback_name="CH2 Schedule 21 irrigation interval duration",
+            fallback_name="6.19 CH2 Schedule interval duration",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.amount.name,
@@ -1964,7 +2322,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             step=1,
             mode="box",
             translation_key="schedule_ch2_amount",
-            fallback_name="CH2 Schedule 18 amount",
+            fallback_name="6.20 CH2 Schedule amount",
         )
         .number(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.fail_safe_duration_min.name,
@@ -1977,7 +2335,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             unit=UnitOfTime.MINUTES,
             mode="box",
             translation_key="schedule_ch2_fail_safe_duration",
-            fallback_name="CH2 Schedule 19 fail safe duration",
+            fallback_name="6.21 CH2 Schedule fail safe duration",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.name,
@@ -1985,7 +2343,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             endpoint_id=2,
             cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             translation_key="schedule_ch2_irrigation_plan_set",
-            fallback_name="CH2 Schedule 22 apply plan",
+            fallback_name="6.22 CH2 Schedule apply plan",
         )
         .write_attr_button(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.remove_plan.name,
@@ -1993,7 +2351,7 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             endpoint_id=2,
             cluster_id=SonoffIrrigationPlanConfigClusterCh2.cluster_id,
             translation_key="schedule_ch2_irrigation_plan_remove",
-            fallback_name="CH2 Schedule 23 remove plan",
+            fallback_name="6.23 CH2 Schedule remove plan",
         )
     )
 
@@ -2004,6 +2362,16 @@ def add_user_delay_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
     return (
         builder.adds(SonoffUserDelayConfigCluster)
         .number(
+            SonoffUserDelayConfigCluster.AttributeDefs.timezone_offset_hours.name,
+            SonoffUserDelayConfigCluster.cluster_id,
+            min_value=-12,
+            max_value=14,
+            step=1,
+            mode="box",
+            translation_key="manual_user_delay_timezone_offset",
+            fallback_name="4.1 Rain delay timezone offset",
+        )
+        .number(
             SonoffUserDelayConfigCluster.AttributeDefs.delay_hours.name,
             SonoffUserDelayConfigCluster.cluster_id,
             min_value=1,
@@ -2011,21 +2379,21 @@ def add_user_delay_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="manual_user_delay_hours",
-            fallback_name="Delay 01 delay hours",
+            fallback_name="4.2 Rain delay hours",
         )
         .write_attr_button(
             SonoffUserDelayConfigCluster.AttributeDefs.apply_delay.name,
             SonoffUserDelayConfigCluster.AttributeDefs.apply_delay.id,
             cluster_id=SonoffUserDelayConfigCluster.cluster_id,
             translation_key="manual_user_delay_apply",
-            fallback_name="Delay 02 apply delay",
+            fallback_name="4.3 Rain delay apply",
         )
         .write_attr_button(
             SonoffUserDelayConfigCluster.AttributeDefs.clear_delay.name,
             SonoffUserDelayConfigCluster.AttributeDefs.clear_delay.id,
             cluster_id=SonoffUserDelayConfigCluster.cluster_id,
             translation_key="manual_user_delay_clear",
-            fallback_name="Delay 03 clear delay",
+            fallback_name="4.4 Rain delay clear",
         )
     )
 
@@ -2041,6 +2409,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
     builder = add_irrigation_plan_config_entities_ch2(builder)
     builder = add_user_delay_config_entities(builder)
     builder = add_amount_unit_config_entity(builder)
+    builder = add_seasonal_adjustment_entities(builder)
 
     return (
         builder
@@ -2049,7 +2418,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             SonoffWaterValveCluster.AttributeDefs.child_lock.name,
             SonoffWaterValveCluster.cluster_id,
             translation_key="child_lock",
-            fallback_name="Child lock",
+            fallback_name="1.1 Child lock",
         )
         # User delay end time (0x5014) → converted to Unix epoch for HA display
         .sensor(
