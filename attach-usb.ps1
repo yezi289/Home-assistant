@@ -1,5 +1,5 @@
 # 自动附加 USB 设备到 WSL
-$BUSID = "6-2"  # 修改为你的设备 BUSID
+$BUSID = "3-2"  # 修改为你的设备 BUSID
 
 Write-Host "正在附加设备 $BUSID 到 WSL..."
 usbipd attach --wsl --busid $BUSID

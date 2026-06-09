@@ -73,6 +73,12 @@ def _put_u32_be(value: int) -> list[int]:
     return list(int(value).to_bytes(4, "big"))
 
 
+def _put_u32_le(value: int) -> list[int]:
+    """Encode an unsigned little-endian 32-bit integer."""
+
+    return list(int(value).to_bytes(4, "little"))
+
+
 
 
 class DelayTimestampPayload(t.FixedList):
@@ -570,6 +576,18 @@ class SonoffWaterValveCluster(CustomCluster):
         self.on_event(
             AttributeWrittenEvent.event_type, self._handle_quarterly_adjustment_change
         )
+        self.on_event(
+            AttributeReadEvent.event_type, self._handle_user_delay_change
+        )
+        self.on_event(
+            AttributeReportedEvent.event_type, self._handle_user_delay_change
+        )
+        self.on_event(
+            AttributeUpdatedEvent.event_type, self._handle_user_delay_change
+        )
+        self.on_event(
+            AttributeWrittenEvent.event_type, self._handle_user_delay_change
+        )
 
     # Handle single irrigation attribute changes
     def _handle_single_irrigation_change(
@@ -648,6 +666,35 @@ class SonoffWaterValveCluster(CustomCluster):
             self.endpoint.sonoff_seasonal_adjustment_config.update_quarterly_adjustment(
                 self._quarterly_adjustment.values
             )
+
+    def _handle_user_delay_change(
+        self,
+        event: AttributeReadEvent
+        | AttributeReportedEvent
+        | AttributeUpdatedEvent
+        | AttributeWrittenEvent,
+    ) -> None:
+        """Sync user delay end datetime (0x5014) to the local delay config cluster."""
+
+        if isinstance(event, AttributeWrittenEvent) and event.status != Status.SUCCESS:
+            return
+        if event.attribute_id != self.AttributeDefs.user_delay_end_datetime.id:
+            return
+
+        values = [event.value]
+        if isinstance(event, AttributeReadEvent) and event.raw_value is not event.value:
+            values.append(event.raw_value)
+
+        for value in values:
+            try:
+                timestamp = int(value)
+                if hasattr(self.endpoint, "sonoff_user_delay_config"):
+                    self.endpoint.sonoff_user_delay_config.update_delay_end_timestamp(
+                        timestamp
+                    )
+                break
+            except (TypeError, ValueError):
+                continue
 
     async def apply_custom_configuration(self, *args, **kwargs):
         """Read single irrigation configuration during pairing."""
@@ -1498,16 +1545,29 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
         timezone_offset_hours: Final = ZCLAttributeDef(id=0x0063, type=t.int8s)
         apply_delay: Final = ZCLAttributeDef(id=0x0061, type=t.uint8_t)
         clear_delay: Final = ZCLAttributeDef(id=0x0062, type=t.uint8_t)
+        delay_end_timestamp: Final = ZCLAttributeDef(id=0x0064, type=t.uint32_t)
 
     def __init__(self, *args, **kwargs):
         """Initialise with sensible defaults and listen for firmware reports."""
         super().__init__(*args, **kwargs)
         self._delay_hours: int = 24
         self._timezone_offset_hours: int = int(_local_timezone_offset_seconds() / 3600)
+        self._delay_end_timestamp: int = 0  # Zigbee epoch, 0 = no active delay
         self._update_attribute(self.AttributeDefs.delay_hours.id, self._delay_hours)
         self._update_attribute(
             self.AttributeDefs.timezone_offset_hours.id,
             self._timezone_offset_hours,
+        )
+        self._update_attribute(
+            self.AttributeDefs.delay_end_timestamp.id,
+            self._delay_end_timestamp,
+        )
+
+    def update_delay_end_timestamp(self, timestamp: int) -> None:
+        """Update local delay end timestamp from device 0x5014 attribute report."""
+        self._delay_end_timestamp = int(timestamp)
+        self._update_attribute(
+            self.AttributeDefs.delay_end_timestamp.id, self._delay_end_timestamp
         )
 
     async def write_attributes(
@@ -1530,14 +1590,10 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
                 self._update_attribute(attr_id, self._timezone_offset_hours)
             elif attr_id == self.AttributeDefs.apply_delay.id:
                 now_zigbee = _zigbee_now_timestamp()
-                end_timestamp = (
-                    now_zigbee
-                    + self._timezone_offset_hours * 3600
-                    + self._delay_hours * 3600
-                )
+                end_timestamp = now_zigbee + self._delay_hours * 3600
                 result = await self.endpoint.sonoff_cluster.command(
                     MANUAL_RAIN_DELAY_CONTROL,
-                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
+                    delay_end_timestamp=DelayTimestampPayload(_put_u32_le(end_timestamp)),
                     manufacturer=None,
                     expect_reply=False,
                 )
