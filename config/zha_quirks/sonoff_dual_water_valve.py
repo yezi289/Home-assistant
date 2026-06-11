@@ -2577,7 +2577,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             fallback_name="Hourly irrigation volume",
         )
 
-    # Daily irrigation duration (always enabled)
+    # Daily irrigation duration (always enabled) - CH1
     result = result.sensor(
         attribute_name=SonoffWaterValveCluster.AttributeDefs.daily_irrigation_duration.name,
         cluster_id=SonoffWaterValveCluster.cluster_id,
@@ -2586,7 +2586,19 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
         unit=UnitOfTime.MINUTES,
         unique_id_suffix="daily_irrigation_duration_v2",
         translation_key="daily_irrigation_duration",
-        fallback_name="Daily irrigation duration",
+        fallback_name="CH1 Daily irrigation duration",
+    )
+    # Daily irrigation duration CH2 (always enabled)
+    result = result.sensor(
+        attribute_name=SonoffWaterValveCluster.AttributeDefs.daily_irrigation_duration.name,
+        cluster_id=SonoffWaterValveCluster.cluster_id,
+        endpoint_id=2,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        unit=UnitOfTime.MINUTES,
+        unique_id_suffix="daily_irrigation_duration_ch2_v2",
+        translation_key="daily_irrigation_duration_ch2",
+        fallback_name="CH2 Daily irrigation duration",
     )
     # Daily irrigation volume (always enabled)
     result = result.sensor(
