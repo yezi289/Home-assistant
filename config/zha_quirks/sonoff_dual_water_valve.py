@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
-
-_LOGGER = logging.getLogger(__name__)
 
 from zigpy.quirks import CustomCluster
 from zigpy.quirks.v2 import (
@@ -36,13 +33,13 @@ from zhaquirks import LocalDataCluster
 # Constants
 SINGLE_IRRIGATION_ARRAY_ITEM_TYPE = foundation.DataTypeId.uint8
 SINGLE_IRRIGATION_PAYLOAD_LEN = 12
-SINGLE_IRRIGATION_DURATION_MIN_MIN = 0
-SINGLE_IRRIGATION_DURATION_MAX_MIN = 65535
+SINGLE_IRRIGATION_DURATION_MIN_MIN = 1
+SINGLE_IRRIGATION_DURATION_MAX_MIN = 719
 SINGLE_IRRIGATION_STEP_MIN = 1
-SINGLE_IRRIGATION_AMOUNT_MIN = 0
-SINGLE_IRRIGATION_AMOUNT_MAX = 65535
-SINGLE_IRRIGATION_FAIL_SAFE_MIN = 0
-SINGLE_IRRIGATION_FAIL_SAFE_MAX = 65535
+SINGLE_IRRIGATION_AMOUNT_MIN = 1
+SINGLE_IRRIGATION_AMOUNT_MAX = 10000
+SINGLE_IRRIGATION_FAIL_SAFE_MIN = 1
+SINGLE_IRRIGATION_FAIL_SAFE_MAX = 719
 SINGLE_IRRIGATION_DEFAULT_TOTAL_DURATION_MIN = 10
 SINGLE_IRRIGATION_DEFAULT_AMOUNT = 30
 SINGLE_IRRIGATION_DEFAULT_FAIL_SAFE_DURATION_MIN = 10
@@ -77,12 +74,6 @@ def _put_u32_be(value: int) -> list[int]:
     """Encode an unsigned big-endian 32-bit integer."""
 
     return list(int(value).to_bytes(4, "big"))
-
-
-def _put_u32_le(value: int) -> list[int]:
-    """Encode an unsigned little-endian 32-bit integer."""
-
-    return list(int(value).to_bytes(4, "little"))
 
 
 
@@ -159,13 +150,21 @@ class SingleIrrigationMode(t.enum8):
     Volume = 0x01
     Duration_With_Interval = 0x02
 
+
+# Manual irrigation mode enum (duration, volume only — no interval support)
+class ManualIrrigationMode(t.enum8):
+    """Manual irrigation mode (duration / volume only)."""
+
+    Duration = 0x00
+    Volume = 0x01
+
 # Amount unit enum (gallon, liter)
 class IrrigationAmountUnit(t.enum8):
     """Single irrigation amount unit."""
 
-    Liter = 0x00
-    Imperial_Gallon = 0x01
-    US_Gallon = 0x02
+    US_Gallon = 0x00
+    Liter = 0x01
+    Imperial_Gallon = 0x02
 
 # Data class (corresponds to single irrigation array)
 @dataclass
@@ -869,44 +868,37 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
             amount=self._single_irrigation_state.amount,
             fail_safe_duration_min=self._single_irrigation_state.fail_safe_duration_min,
         )
-        pending_mode = state.irrigation_mode
 
-        # Filter out attributes not writable in current mode (filter rather than raise to avoid breaking HA call chain)
-        filtered_attributes: dict[str | int | ZCLAttributeDef, Any] = {}
+        # Determine the final mode after this write (mode change may be in the same batch)
+        final_mode = state.irrigation_mode
+        for attr, value in attributes.items():
+            attr_def = self.find_attribute(attr)
+            if attr_def.id == self.AttributeDefs.irrigation_mode.id:
+                final_mode = int(value)
+
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
-            if attr_id == self.AttributeDefs.irrigation_mode.id:
-                pending_mode = int(value)
             if (
-                pending_mode == SingleIrrigationMode.Duration
+                final_mode == SingleIrrigationMode.Duration
                 and attr_id
                 in (
                     self.AttributeDefs.amount.id,
                     self.AttributeDefs.fail_safe_duration_min.id,
                 )
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in volume mode "
-                    "(device is in duration mode)",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Single irrigation amount and fail safe duration are only "
+                    "configurable in volume mode"
                 )
-                continue
             if (
-                pending_mode == SingleIrrigationMode.Volume
+                final_mode == SingleIrrigationMode.Volume
                 and attr_id == self.AttributeDefs.total_duration_min.id
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in duration mode "
-                    "(device is in volume mode)",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Single irrigation total duration is only configurable in "
+                    "duration mode"
                 )
-                continue
-            filtered_attributes[attr] = value
-        # All filtered, return success to avoid empty write
-        if not filtered_attributes:
-            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
-        attributes = filtered_attributes
 
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
@@ -945,7 +937,8 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
                 ]
             )
             config_result = raw_result
-            # Only update local state on successful write, otherwise keep original to stay consistent with device
+
+        # Only update local state on successful write, otherwise keep original to stay consistent with device
         if config_result is not None and self._write_succeeded(config_result):
             self._has_device_single_irrigation_state = False
             self._single_irrigation_state = state
@@ -965,7 +958,16 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
                 self.AttributeDefs.fail_safe_duration_min.id,
                 self._single_irrigation_state.fail_safe_duration_min,
             )
-        return config_result if config_result is not None else [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
+            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
+        else:
+            # Write failed — return failure for all attempted attrs
+            return [[
+                foundation.WriteAttributesStatusRecord(
+                    status=Status.FAILURE,
+                    attrid=self.find_attribute(attr).id,
+                )
+                for attr, value in attributes.items()
+            ]]
 
     @staticmethod
     def _write_succeeded(result: list) -> bool:
@@ -1139,14 +1141,16 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
         **kwargs,
     ) -> list:
         """Update local plan fields or trigger set/remove actions."""
-        # Filter out attributes not writable in current mode (consistent with single irrigation config)
+        # Determine the final mode after this write (mode change may be in the same batch)
         pending_mode = self._irrigation_mode
-        filtered_attributes: dict[str | int | ZCLAttributeDef, Any] = {}
+        for attr, value in attributes.items():
+            attr_def = self.find_attribute(attr)
+            if attr_def.id == self.AttributeDefs.irrigation_mode.id:
+                pending_mode = int(value)
+
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
-            if attr_id == self.AttributeDefs.irrigation_mode.id:
-                pending_mode = int(value)
             if (
                 pending_mode
                 in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval)
@@ -1156,22 +1160,18 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     self.AttributeDefs.fail_safe_duration_min.id,
                 )
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in volume mode "
-                    "(device is in %s mode)",
-                    attr_def.name, value, SingleIrrigationMode(pending_mode).name,
+                raise ValueError(
+                    "Irrigation amount and fail safe duration are only "
+                    "configurable in volume mode"
                 )
-                continue
             if (
                 pending_mode == SingleIrrigationMode.Volume
                 and attr_id == self.AttributeDefs.total_duration_min.id
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in duration mode "
-                    "(device is in volume mode)",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Irrigation total duration is only configurable in "
+                    "duration mode"
                 )
-                continue
             if (
                 pending_mode != SingleIrrigationMode.Duration_With_Interval
                 and attr_id
@@ -1180,15 +1180,10 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     self.AttributeDefs.interval_duration_min.id,
                 )
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in duration-with-interval mode",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Duration and interval duration are only configurable "
+                    "in duration-with-interval mode"
                 )
-                continue
-            filtered_attributes[attr] = value
-        if not filtered_attributes:
-            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
-        attributes = filtered_attributes
 
         result = []
         for attr, value in attributes.items():
@@ -1255,6 +1250,36 @@ class SonoffIrrigationPlanConfigCluster(LocalDataCluster):
                     index=t.uint8_t(self._plan_index),
                     manufacturer=None,
                     expect_reply=False,
+                )
+
+        # Validate duration/interval constraints in Duration_With_Interval mode
+        if pending_mode == SingleIrrigationMode.Duration_With_Interval:
+            final_total = self._total_duration_min
+            final_duration = self._duration_min
+            final_interval = self._interval_duration_min
+            for attr, value in attributes.items():
+                attr_def = self.find_attribute(attr)
+                if attr_def.id == self.AttributeDefs.total_duration_min.id:
+                    final_total = int(value)
+                elif attr_def.id == self.AttributeDefs.duration_min.id:
+                    final_duration = int(value)
+                elif attr_def.id == self.AttributeDefs.interval_duration_min.id:
+                    final_interval = int(value)
+            if final_duration > final_total:
+                raise ValueError(
+                    f"Duration ({final_duration} min) must not exceed "
+                    f"total duration ({final_total} min)"
+                )
+            if final_interval > final_total:
+                raise ValueError(
+                    f"Interval duration ({final_interval} min) must not exceed "
+                    f"total duration ({final_total} min)"
+                )
+            if final_duration + final_interval > final_total:
+                raise ValueError(
+                    f"Duration ({final_duration} min) + interval duration "
+                    f"({final_interval} min) must not exceed "
+                    f"total duration ({final_total} min)"
                 )
 
         self._update_all_attributes()
@@ -1409,14 +1434,16 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
         **kwargs,
     ) -> list:
         """Update local plan fields or trigger set/remove actions (channel 2)."""
-        # Filter out attributes not writable in current mode (consistent with single irrigation config)
+        # Determine the final mode after this write (mode change may be in the same batch)
         pending_mode = self._irrigation_mode
-        filtered_attributes: dict[str | int | ZCLAttributeDef, Any] = {}
+        for attr, value in attributes.items():
+            attr_def = self.find_attribute(attr)
+            if attr_def.id == self.AttributeDefs.irrigation_mode.id:
+                pending_mode = int(value)
+
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
-            if attr_id == self.AttributeDefs.irrigation_mode.id:
-                pending_mode = int(value)
             if (
                 pending_mode
                 in (SingleIrrigationMode.Duration, SingleIrrigationMode.Duration_With_Interval)
@@ -1426,22 +1453,18 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     self.AttributeDefs.fail_safe_duration_min.id,
                 )
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in volume mode "
-                    "(device is in %s mode)",
-                    attr_def.name, value, SingleIrrigationMode(pending_mode).name,
+                raise ValueError(
+                    "Irrigation amount and fail safe duration are only "
+                    "configurable in volume mode"
                 )
-                continue
             if (
                 pending_mode == SingleIrrigationMode.Volume
                 and attr_id == self.AttributeDefs.total_duration_min.id
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in duration mode "
-                    "(device is in volume mode)",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Irrigation total duration is only configurable in "
+                    "duration mode"
                 )
-                continue
             if (
                 pending_mode != SingleIrrigationMode.Duration_With_Interval
                 and attr_id
@@ -1450,15 +1473,10 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     self.AttributeDefs.interval_duration_min.id,
                 )
             ):
-                _LOGGER.warning(
-                    "Ignoring attribute %s=%s: only configurable in duration-with-interval mode",
-                    attr_def.name, value,
+                raise ValueError(
+                    "Duration and interval duration are only configurable "
+                    "in duration-with-interval mode"
                 )
-                continue
-            filtered_attributes[attr] = value
-        if not filtered_attributes:
-            return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
-        attributes = filtered_attributes
 
         result = []
         for attr, value in attributes.items():
@@ -1523,6 +1541,36 @@ class SonoffIrrigationPlanConfigClusterCh2(LocalDataCluster):
                     index=t.uint8_t(self._plan_index),
                     manufacturer=None,
                     expect_reply=False,
+                )
+
+        # Validate duration/interval constraints in Duration_With_Interval mode
+        if pending_mode == SingleIrrigationMode.Duration_With_Interval:
+            final_total = self._total_duration_min
+            final_duration = self._duration_min
+            final_interval = self._interval_duration_min
+            for attr, value in attributes.items():
+                attr_def = self.find_attribute(attr)
+                if attr_def.id == self.AttributeDefs.total_duration_min.id:
+                    final_total = int(value)
+                elif attr_def.id == self.AttributeDefs.duration_min.id:
+                    final_duration = int(value)
+                elif attr_def.id == self.AttributeDefs.interval_duration_min.id:
+                    final_interval = int(value)
+            if final_duration > final_total:
+                raise ValueError(
+                    f"Duration ({final_duration} min) must not exceed "
+                    f"total duration ({final_total} min)"
+                )
+            if final_interval > final_total:
+                raise ValueError(
+                    f"Interval duration ({final_interval} min) must not exceed "
+                    f"total duration ({final_total} min)"
+                )
+            if final_duration + final_interval > final_total:
+                raise ValueError(
+                    f"Duration ({final_duration} min) + interval duration "
+                    f"({final_interval} min) must not exceed "
+                    f"total duration ({final_total} min)"
                 )
 
         self._update_all_attributes()
@@ -1596,10 +1644,10 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
                 self._update_attribute(attr_id, self._timezone_offset_hours)
             elif attr_id == self.AttributeDefs.apply_delay.id:
                 now_zigbee = _zigbee_now_timestamp()
-                end_timestamp = now_zigbee + self._delay_hours * 3600
+                end_timestamp = now_zigbee + self._timezone_offset_hours * 3600 + self._delay_hours * 3600
                 result = await self.endpoint.sonoff_cluster.command(
                     MANUAL_RAIN_DELAY_CONTROL,
-                    delay_end_timestamp=DelayTimestampPayload(_put_u32_le(end_timestamp)),
+                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
                     manufacturer=None,
                     expect_reply=False,
                 )
@@ -1863,7 +1911,7 @@ def add_single_irrigation_config_entities(builder: QuirkBuilder) -> QuirkBuilder
         builder.adds(SonoffSingleIrrigationConfigCluster)
         .enum(
             SonoffSingleIrrigationConfigCluster.AttributeDefs.irrigation_mode.name,
-            SingleIrrigationMode,
+            ManualIrrigationMode,
             SonoffSingleIrrigationConfigCluster.cluster_id,
             entity_type=EntityType.CONFIG,
             translation_key="manual_single_irrigation_mode",
@@ -2577,39 +2625,39 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
             fallback_name="Hourly irrigation volume",
         )
 
-    # Daily irrigation duration (always enabled) - CH1
+    # Hour irrigation duration (always enabled) - CH1
     result = result.sensor(
-        attribute_name=SonoffWaterValveCluster.AttributeDefs.daily_irrigation_duration.name,
+        attribute_name=SonoffWaterValveCluster.AttributeDefs.hour_irrigation_duration.name,
         cluster_id=SonoffWaterValveCluster.cluster_id,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         unit=UnitOfTime.MINUTES,
-        unique_id_suffix="daily_irrigation_duration_v2",
-        translation_key="daily_irrigation_duration",
-        fallback_name="CH1 Daily irrigation duration",
+        unique_id_suffix="hour_irrigation_duration_v2",
+        translation_key="hour_irrigation_duration",
+        fallback_name="CH1 Hour irrigation duration",
     )
-    # Daily irrigation duration CH2 (always enabled)
+    # Hour irrigation duration CH2 (always enabled)
     result = result.sensor(
-        attribute_name=SonoffWaterValveCluster.AttributeDefs.daily_irrigation_duration.name,
+        attribute_name=SonoffWaterValveCluster.AttributeDefs.hour_irrigation_duration.name,
         cluster_id=SonoffWaterValveCluster.cluster_id,
         endpoint_id=2,
         device_class=SensorDeviceClass.DURATION,
         state_class=SensorStateClass.MEASUREMENT,
         unit=UnitOfTime.MINUTES,
-        unique_id_suffix="daily_irrigation_duration_ch2_v2",
-        translation_key="daily_irrigation_duration_ch2",
-        fallback_name="CH2 Daily irrigation duration",
+        unique_id_suffix="hour_irrigation_duration_ch2_v2",
+        translation_key="hour_irrigation_duration_ch2",
+        fallback_name="CH2 Hour irrigation duration",
     )
-    # Daily irrigation volume (always enabled)
+    # Hour irrigation volume (always enabled)
     result = result.sensor(
-        attribute_name=SonoffWaterValveCluster.AttributeDefs.daily_irrigation_volume.name,
+        attribute_name=SonoffWaterValveCluster.AttributeDefs.hour_irrigation_volume.name,
         cluster_id=SonoffWaterValveCluster.cluster_id,
         device_class=SensorDeviceClass.VOLUME,
         state_class=SensorStateClass.TOTAL_INCREASING,
         unit=UnitOfVolume.LITERS,
-        unique_id_suffix="daily_irrigation_volume_v2",
-        translation_key="daily_irrigation_volume",
-        fallback_name="Daily irrigation volume",
+        unique_id_suffix="hour_irrigation_volume_v2",
+        translation_key="hour_irrigation_volume",
+        fallback_name="Hour irrigation volume",
     )
 
     return result
@@ -2621,8 +2669,6 @@ add_common_entities(
     .also_applies_to("SONOFF", "SWV-ZN2E")
     .also_applies_to("SONOFF", "SWV-ZN2U")
     .also_applies_to("SONOFF", "SWV-ZF2")
-    .also_applies_to("SONOFF", "SWV-ZFE")
-    .also_applies_to("SONOFF", "SWV-ZFU")
     .also_applies_to("SONOFF", "SWV-ZNE")
     .also_applies_to("SONOFF", "SWV-ZNU")
 ).add_to_registry()
