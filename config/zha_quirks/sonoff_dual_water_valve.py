@@ -49,6 +49,7 @@ IRRIGATION_PLAN_MAX_COUNT = 6
 IRRIGATION_PLAN_SET_COMMAND_ID = 0x06
 IRRIGATION_PLAN_REMOVE_COMMAND_ID = 0x07
 MANUAL_RAIN_DELAY_CONTROL = 0x08
+USER_DELAY_MAX_HOURS = 7 * 24
 QUARTERLY_ADJUSTMENT_PAYLOAD_LEN = 12
 QUARTERLY_ADJUSTMENT_DEFAULT_VALUE = 10
 ZIGBEE_EPOCH_OFFSET = 946684800
@@ -162,8 +163,8 @@ class ManualIrrigationMode(t.enum8):
 class IrrigationAmountUnit(t.enum8):
     """Single irrigation amount unit."""
 
-    US_Gallon = 0x00
-    Liter = 0x01
+    Liter = 0x00
+    US_Gallon = 0x01
     Imperial_Gallon = 0x02
 
 # Data class (corresponds to single irrigation array)
@@ -1624,43 +1625,49 @@ class SonoffUserDelayConfigCluster(LocalDataCluster):
             self.AttributeDefs.delay_end_timestamp.id, self._delay_end_timestamp
         )
 
+    async def _send_user_delay_timestamp(self, end_timestamp: int) -> Any:
+        """Send the firmware user delay command payload."""
+
+        return await self.endpoint.sonoff_cluster.command(
+            MANUAL_RAIN_DELAY_CONTROL,
+            delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
+            manufacturer=None,
+            expect_reply=False,
+        )
+
     async def write_attributes(
         self,
         attributes: dict[str | int | ZCLAttributeDef, Any],
         **_kwargs: Any,
     ) -> list:
-        """Handle local writes: cache delay_hours/timezone_offset, trigger apply/clear via
-        command 0x08 on the real SONOFF cluster."""
+        """Update delay duration or trigger the manual rain delay command."""
 
         result = []
         for attr, value in attributes.items():
             attr_def = self.find_attribute(attr)
             attr_id = attr_def.id
             if attr_id == self.AttributeDefs.delay_hours.id:
-                self._delay_hours = int(value)
-                self._update_attribute(attr_id, self._delay_hours)
+                self._delay_hours = max(0, min(int(value), USER_DELAY_MAX_HOURS))
             elif attr_id == self.AttributeDefs.timezone_offset_hours.id:
                 self._timezone_offset_hours = max(-12, min(int(value), 14))
-                self._update_attribute(attr_id, self._timezone_offset_hours)
             elif attr_id == self.AttributeDefs.apply_delay.id:
-                now_zigbee = _zigbee_now_timestamp()
-                end_timestamp = now_zigbee + self._timezone_offset_hours * 3600 + self._delay_hours * 3600
-                result = await self.endpoint.sonoff_cluster.command(
-                    MANUAL_RAIN_DELAY_CONTROL,
-                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(end_timestamp)),
-                    manufacturer=None,
-                    expect_reply=False,
+                delay_hours = max(0, min(self._delay_hours, USER_DELAY_MAX_HOURS))
+                end_timestamp = (
+                    _zigbee_now_timestamp()
+                    + self._timezone_offset_hours * 3600
+                    + delay_hours * 3600
                 )
+                result = await self._send_user_delay_timestamp(end_timestamp)
             elif attr_id == self.AttributeDefs.clear_delay.id:
                 # Send 0 to clear the delay — firmware treats this as
                 # "no tasks in range" which clears all is_delay flags.
-                result = await self.endpoint.sonoff_cluster.command(
-                    MANUAL_RAIN_DELAY_CONTROL,
-                    delay_end_timestamp=DelayTimestampPayload(_put_u32_be(0)),
-                    manufacturer=None,
-                    expect_reply=False,
-                )
+                result = await self._send_user_delay_timestamp(0)
 
+        self._update_attribute(self.AttributeDefs.delay_hours.id, self._delay_hours)
+        self._update_attribute(
+            self.AttributeDefs.timezone_offset_hours.id,
+            self._timezone_offset_hours,
+        )
         if result:
             return result
         return [[foundation.WriteAttributesStatusRecord(status=Status.SUCCESS)]]
@@ -1787,7 +1794,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_january",
-            fallback_name="7.1 Schedule seasonal adjustment january",
+            fallback_name="7.1 Schedule seasonal adjustment january (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_february.name,
@@ -1797,7 +1807,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_february",
-            fallback_name="7.2 Schedule seasonal adjustment february",
+            fallback_name="7.2 Schedule seasonal adjustment february (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_march.name,
@@ -1807,7 +1820,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_march",
-            fallback_name="7.3 Schedule seasonal adjustment march",
+            fallback_name="7.3 Schedule seasonal adjustment march (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_april.name,
@@ -1817,7 +1833,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_april",
-            fallback_name="7.4 Schedule seasonal adjustment april",
+            fallback_name="7.4 Schedule seasonal adjustment april (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_may.name,
@@ -1827,7 +1846,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_may",
-            fallback_name="7.5 Schedule seasonal adjustment may",
+            fallback_name="7.5 Schedule seasonal adjustment may (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_june.name,
@@ -1837,7 +1859,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_june",
-            fallback_name="7.6 Schedule seasonal adjustment june",
+            fallback_name="7.6 Schedule seasonal adjustment june (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_july.name,
@@ -1847,7 +1872,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_july",
-            fallback_name="7.7 Schedule seasonal adjustment july",
+            fallback_name="7.7 Schedule seasonal adjustment july (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_august.name,
@@ -1857,7 +1885,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_august",
-            fallback_name="7.8 Schedule seasonal adjustment august",
+            fallback_name="7.8 Schedule seasonal adjustment august (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_september.name,
@@ -1867,7 +1898,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_september",
-            fallback_name="7.9 Schedule seasonal adjustment september",
+            fallback_name="7.9 Schedule seasonal adjustment september (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_october.name,
@@ -1877,7 +1911,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_october",
-            fallback_name="7.10 Schedule seasonal adjustment october",
+            fallback_name="7.10 Schedule seasonal adjustment october (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_november.name,
@@ -1887,7 +1924,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_november",
-            fallback_name="7.11 Schedule seasonal adjustment november",
+            fallback_name="7.11 Schedule seasonal adjustment november (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
         .number(
             SonoffSeasonalAdjustmentConfigCluster.AttributeDefs.seasonal_adjustment_december.name,
@@ -1897,7 +1937,10 @@ def add_seasonal_adjustment_entities(builder: QuirkBuilder) -> QuirkBuilder:
             step=1,
             mode="box",
             translation_key="schedule_seasonal_adjustment_december",
-            fallback_name="7.12 Schedule seasonal adjustment december",
+            fallback_name="7.12 Schedule seasonal adjustment december (Seasonal adjustment: " \
+            "The value set here is 10 times the actual watering multiplier. For example," \
+            "setting it to 1 means the actual watering amount is 0.1 times the original amount; " \
+            "setting it to 5 means 0.5 times; setting it to 13 means 1.3 times.)",
         )
     )
 
@@ -2488,10 +2531,12 @@ def add_user_delay_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
         .number(
             SonoffUserDelayConfigCluster.AttributeDefs.delay_hours.name,
             SonoffUserDelayConfigCluster.cluster_id,
-            min_value=1,
-            max_value=720,
+            min_value=0,
+            max_value=168,
             step=1,
             mode="box",
+            device_class=NumberDeviceClass.DURATION,
+            unit=UnitOfTime.HOURS,
             translation_key="manual_user_delay_hours",
             fallback_name="4.1 Rain delay hours",
         )
@@ -2654,7 +2699,7 @@ def add_common_entities(builder: QuirkBuilder) -> QuirkBuilder:
         cluster_id=SonoffWaterValveCluster.cluster_id,
         device_class=SensorDeviceClass.VOLUME,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        unit=UnitOfVolume.LITERS,
+        # unit=UnitOfVolume.LITERS,
         unique_id_suffix="hour_irrigation_volume_v2",
         translation_key="hour_irrigation_volume",
         fallback_name="Hour irrigation volume",
