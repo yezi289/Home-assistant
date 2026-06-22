@@ -15,7 +15,6 @@ from zigpy.quirks.v2 import (
     SensorDeviceClass,
     SensorStateClass,
 )
-from zigpy.quirks.v2 import EntityType
 from zigpy.quirks.v2.homeassistant import UnitOfTime, UnitOfVolume
 from zigpy.quirks.v2.homeassistant.binary_sensor import BinarySensorDeviceClass
 import zigpy.types as t
@@ -75,8 +74,6 @@ def _put_u32_be(value: int) -> list[int]:
     """Encode an unsigned big-endian 32-bit integer."""
 
     return list(int(value).to_bytes(4, "big"))
-
-
 
 
 class DelayTimestampPayload(t.FixedList):
@@ -846,8 +843,6 @@ class SonoffSingleIrrigationConfigCluster(LocalDataCluster):
         """Delegate to the global amount unit cluster."""
         if hasattr(self.endpoint, "sonoff_amount_unit_config"):
             self.endpoint.sonoff_amount_unit_config.update_amount_unit(unit)
-
-
 
     # Write manual irrigation attributes to zigbee
     async def write_attributes(
@@ -2245,8 +2240,6 @@ def add_irrigation_plan_config_entities(builder: QuirkBuilder) -> QuirkBuilder:
             fallback_name="5.21 CH1 Schedule-Sunday",
         )
 
-
-
         .write_attr_button(
             SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.name,
             SonoffIrrigationPlanConfigCluster.AttributeDefs.apply_plan.id,
@@ -2491,8 +2484,6 @@ def add_irrigation_plan_config_entities_ch2(builder: QuirkBuilder) -> QuirkBuild
             translation_key="schedule_ch2_irrigation_plan_sunday",
             fallback_name="6.21 CH2 Schedule-Sunday",
         )
-
-
 
         .write_attr_button(
             SonoffIrrigationPlanConfigClusterCh2.AttributeDefs.apply_plan.name,
