@@ -44,9 +44,10 @@ config/OZW_Log.txt
 # IP 封禁记录
 config/ip_bans.yaml
 
-# 备份文件
+# 备份文件 / 目录
 *.backup
 *.bak
+config/zha_quirks/bak/
 *.swp
 *.swo
 *~
