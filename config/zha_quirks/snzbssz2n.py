@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 from zigpy.quirks import CustomCluster
-from zigpy.quirks.v2 import NumberDeviceClass, QuirkBuilder
+from zigpy.quirks.v2 import NumberDeviceClass, QuirkBuilder, SensorDeviceClass
 from zigpy.quirks.v2.homeassistant import PERCENTAGE, UnitOfTemperature
 import zigpy.types as t
+from zigpy.zcl import foundation
+from zigpy.zcl.clusters.measurement import SoilMoisture
 from zigpy.zcl.foundation import BaseAttributeDefs, DataTypeId, ZCLAttributeDef
 
 
@@ -101,16 +103,81 @@ class SonoffSoilCluster(CustomCluster):
             manufacturer_code=None,
         )
 
+    def _value_for_write(
+        self,
+        attributes: dict[str | int | ZCLAttributeDef, Any],
+        attr_def: ZCLAttributeDef,
+        default: int,
+    ) -> int:
+        """Return a pending value, or the cached/device default value."""
+
+        for attr, value in attributes.items():
+            if self.find_attribute(attr).id == attr_def.id:
+                return int(value)
+        return int(self._attr_cache.get(attr_def.id, default))
+
+    async def write_attributes(
+        self,
+        attributes: dict[str | int | ZCLAttributeDef, Any],
+        **kwargs: Any,
+    ) -> list[list[foundation.WriteAttributesStatusRecord]]:
+        """Reject threshold ranges where the lower limit exceeds the upper limit."""
+
+        attributes = dict(attributes)
+        for attr, value in attributes.items():
+            attr_id = self.find_attribute(attr).id
+            if attr_id == self.AttributeDefs.temperature_offset.id:
+                # The device stores hundredths of a degree; align 0.1 C input
+                # to a multiple of ten to avoid float conversion truncation.
+                attributes[attr] = int(round(int(value) / 10.0) * 10)
+            elif attr_id == self.AttributeDefs.humidity_offset.id and int(value) % 100:
+                return [
+                    [
+                        foundation.WriteAttributesStatusRecord(
+                            foundation.Status.INVALID_VALUE
+                        )
+                    ]
+                ]
+
+        temperature_low = self._value_for_write(
+            attributes, self.AttributeDefs.temperature_threshold_low, 8
+        )
+        temperature_high = self._value_for_write(
+            attributes, self.AttributeDefs.temperature_threshold_high, 32
+        )
+        humidity_dry = self._value_for_write(
+            attributes, self.AttributeDefs.humidity_threshold_dry, 15
+        )
+        humidity_damp = self._value_for_write(
+            attributes, self.AttributeDefs.humidity_threshold_damp, 30
+        )
+
+        if temperature_low > temperature_high or humidity_dry > humidity_damp:
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.INVALID_VALUE
+                    )
+                ]
+            ]
+
+        return await super().write_attributes(attributes, **kwargs)
+
 
 (
     QuirkBuilder("SONOFF", "SS-Z2N")
     .applies_to("SONOFF", "SNZB-SSZ2N")
     .replaces(SonoffSoilCluster)
+    .change_entity_metadata(
+        endpoint_id=1,
+        cluster_id=SoilMoisture.cluster_id,
+        new_device_class=SensorDeviceClass.MOISTURE,
+    )
     .enum(
         SonoffSoilCluster.AttributeDefs.temperature_unit.name,
         TemperatureUnit,
         SonoffSoilCluster.cluster_id,
-        translation_key="display_unit",
+        translation_key="snzbssz2n_temperature_unit",
         fallback_name="11 Temperature unit",
     )
     .number(
@@ -123,7 +190,7 @@ class SonoffSoilCluster(CustomCluster):
         device_class=NumberDeviceClass.TEMPERATURE_DELTA,
         unit=UnitOfTemperature.CELSIUS,
         multiplier=0.01,
-        translation_key="temperature_offset",
+        translation_key="snzbssz2n_temperature_offset",
         fallback_name="9 Temperature offset",
     )
     .number(
@@ -136,14 +203,14 @@ class SonoffSoilCluster(CustomCluster):
         device_class=NumberDeviceClass.HUMIDITY,
         unit=PERCENTAGE,
         multiplier=0.01,
-        translation_key="humidity_offset",
+        translation_key="snzbssz2n_humidity_offset",
         fallback_name="10 Humidity offset",
     )
     .enum(
         SonoffSoilCluster.AttributeDefs.measure_interval.name,
         MeasureInterval,
         SonoffSoilCluster.cluster_id,
-        translation_key="measure_interval",
+        translation_key="snzbssz2n_measure_interval",
         fallback_name="12 Measure interval",
     )
     .switch(
@@ -151,7 +218,7 @@ class SonoffSoilCluster(CustomCluster):
         SonoffSoilCluster.cluster_id,
         off_value=0,
         on_value=1,
-        translation_key="temperature_threshold_enable",
+        translation_key="snzbssz2n_temperature_threshold_enable",
         fallback_name="1 Temperature threshold enable",
     )
     .number(
@@ -163,7 +230,7 @@ class SonoffSoilCluster(CustomCluster):
         mode="box",
         device_class=NumberDeviceClass.TEMPERATURE,
         unit=UnitOfTemperature.CELSIUS,
-        translation_key="temperature_threshold_high",
+        translation_key="snzbssz2n_temperature_threshold_high",
         fallback_name="2 Temperature threshold high",
     )
     .number(
@@ -175,7 +242,7 @@ class SonoffSoilCluster(CustomCluster):
         mode="box",
         device_class=NumberDeviceClass.TEMPERATURE,
         unit=UnitOfTemperature.CELSIUS,
-        translation_key="temperature_threshold_low",
+        translation_key="snzbssz2n_temperature_threshold_low",
         fallback_name="3 Temperature threshold low",
     )
     .switch(
@@ -183,7 +250,7 @@ class SonoffSoilCluster(CustomCluster):
         SonoffSoilCluster.cluster_id,
         off_value=0,
         on_value=1,
-        translation_key="humidity_threshold_enable",
+        translation_key="snzbssz2n_humidity_threshold_enable",
         fallback_name="4 Humidity threshold enable",
     )
     .number(
@@ -195,8 +262,8 @@ class SonoffSoilCluster(CustomCluster):
         mode="box",
         device_class=NumberDeviceClass.HUMIDITY,
         unit=PERCENTAGE,
-        translation_key="humidity_threshold_dry",
-        fallback_name="5 Humidity threshold dry",
+        translation_key="snzbssz2n_humidity_threshold_dry",
+        fallback_name="6 Humidity threshold dry",
     )
     .number(
         SonoffSoilCluster.AttributeDefs.humidity_threshold_damp.name,
@@ -207,15 +274,15 @@ class SonoffSoilCluster(CustomCluster):
         mode="box",
         device_class=NumberDeviceClass.HUMIDITY,
         unit=PERCENTAGE,
-        translation_key="humidity_threshold_damp",
-        fallback_name="6 Humidity threshold damp",
+        translation_key="snzbssz2n_humidity_threshold_damp",
+        fallback_name="5 Humidity threshold damp",
     )
     .switch(
         SonoffSoilCluster.AttributeDefs.frost_threshold_enable.name,
         SonoffSoilCluster.cluster_id,
         off_value=0,
         on_value=1,
-        translation_key="frost_threshold_enable",
+        translation_key="snzbssz2n_frost_threshold_enable",
         fallback_name="7 Frost threshold enable",
     )
     .number(
@@ -227,7 +294,7 @@ class SonoffSoilCluster(CustomCluster):
         mode="box",
         device_class=NumberDeviceClass.TEMPERATURE,
         unit=UnitOfTemperature.CELSIUS,
-        translation_key="frost_threshold_temperature",
+        translation_key="snzbssz2n_frost_threshold_temperature",
         fallback_name="8 Frost threshold temperature",
     )
     .add_to_registry()
