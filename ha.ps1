@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0)]
     [ValidateSet("start", "stop", "restart", "logs", "shell", "open", "status", "help")]
     [string]$Action = "help"
